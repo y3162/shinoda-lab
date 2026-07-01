@@ -56,5 +56,3 @@ python -m src.database.03_2_insert_noise_confgs_from_demand
 ```bash
 python -m src.database.04_1_create_table_asr_results
 ```
-
----
