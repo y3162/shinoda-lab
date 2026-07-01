@@ -6,3 +6,15 @@ To speed up the loading process, we can clip the noise audio file into shorter s
 ```bash
 python -m src.database.00_clip_demand --duration 20
 ```
+
+## Create Utterances Table
+
+```bash
+python -m src.database.01_1_create_table_utterances
+```
+
+### Insert Utterances from *LibriSpeech* Dataset
+
+```bash
+python -m src.database.01_2_insert_utterances_from_librispeech
+```
