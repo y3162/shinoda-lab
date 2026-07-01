@@ -25,16 +25,16 @@ def create_utterances_table_if_needed(
     con.execute(
         """
         CREATE TABLE utterances (
-            id           INTEGER PRIMARY KEY DEFAULT nextval('utterances_id_seq'),
-            dataset_name VARCHAR NOT NULL,
-            split        VARCHAR NOT NULL,
-            audio_path   VARCHAR NOT NULL,
-            speaker_id   VARCHAR NOT NULL,
-            section_id   VARCHAR NOT NULL,
-            transcript   VARCHAR NOT NULL,
-            sample_rate  INTEGER NOT NULL,
-            channels     INTEGER NOT NULL,
-            frame_count  INTEGER NOT NULL,
+            id              INTEGER PRIMARY KEY DEFAULT nextval('utterances_id_seq'),
+            dataset_name    VARCHAR NOT NULL,
+            split           VARCHAR NOT NULL,
+            audio_path      VARCHAR NOT NULL,
+            speaker_id      VARCHAR NOT NULL,
+            section_id      VARCHAR NOT NULL,
+            transcript      VARCHAR NOT NULL,
+            sample_rate     INTEGER NOT NULL,
+            channels        INTEGER NOT NULL,
+            frame_count     INTEGER NOT NULL,
 
             UNIQUE (
                 dataset_name,

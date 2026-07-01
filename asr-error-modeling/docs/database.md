@@ -34,3 +34,27 @@ python -m src.database.02_1_create_table_noises
 ```bash
 python -m src.database.02_2_insert_noises_from_demand
 ```
+
+---
+
+## Create Noise Configs Table
+
+```bash
+python -m src.database.03_1_create_table_noise_configs
+```
+
+### Insert Noise Configs from *DEMAND* Dataset
+
+```bash
+python -m src.database.03_2_insert_noise_confgs_from_demand
+```
+
+---
+
+## Create ASR Results Table
+
+```bash
+python -m src.database.04_1_create_table_asr_results
+```
+
+---

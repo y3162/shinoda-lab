@@ -25,13 +25,13 @@ def create_noises_table_if_needed(
     con.execute(
         """
         CREATE TABLE noises (
-            id                  INTEGER PRIMARY KEY DEFAULT nextval('noises_id_seq'),
-            dataset_name        VARCHAR NOT NULL,
-            audio_path          VARCHAR NOT NULL,
-            noise_type          VARCHAR NOT NULL,
-            sample_rate         INTEGER NOT NULL,
-            channels            INTEGER NOT NULL,
-            frame_count         INTEGER NOT NULL,
+            id              INTEGER PRIMARY KEY DEFAULT nextval('noises_id_seq'),
+            dataset_name    VARCHAR NOT NULL,
+            audio_path      VARCHAR NOT NULL,
+            noise_type      VARCHAR NOT NULL,
+            sample_rate     INTEGER NOT NULL,
+            channels        INTEGER NOT NULL,
+            frame_count     INTEGER NOT NULL,
 
             UNIQUE (
                 dataset_name,
