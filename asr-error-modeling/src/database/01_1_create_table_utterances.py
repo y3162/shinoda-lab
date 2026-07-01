@@ -1,8 +1,9 @@
 import duckdb as db
 
 from src.utils.print import (
-    print_error,
     print_log,
+    print_warning,
+    print_error,
 )
 from src.config import SQL_ROOT
 from src.utils.sql import check_table_exists
@@ -49,7 +50,7 @@ def create_utterances_table_if_needed(
 
 def main() -> None:
     if SQL_ROOT.exists():
-        print_error(f'SQL database already exists at {SQL_ROOT}')
+        print_warning(f'SQL database already exists at {SQL_ROOT}')
         return
     else:
         print_log(f'Creating SQL database at {SQL_ROOT}')
