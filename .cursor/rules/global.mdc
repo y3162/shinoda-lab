@@ -1,0 +1,24 @@
+---
+description: Global rules for the entire repository and AI behavior guidelines
+globs: "*"
+alwaysApply: true
+---
+
+# Global Monorepo Rules
+
+## Project Selection (CRITICAL)
+
+This repository is a monorepo containing multiple projects.
+Before creating or modifying files, or suggesting commands, you MUST **identify which project (subdirectory) is the current target of the operation**.
+If the target project is ambiguous or cannot be determined from the user's instructions, DO NOT GUESS. You must stop and explicitly ask the user: "Which project are we working on?"
+
+## Working Directory & Commands
+
+- When considering file paths or code imports, always assume the **root directory of the target project** is the current working directory.
+- If you cannot find a command or its alternatives, **do not install it**. Instead, ask me.
+- Before using GPUs, you need to check if the GPUs are available using `nvidia-smi`.
+
+## READMEs
+
+`README.md` files are not for the you but for the users.
+You should not read them.

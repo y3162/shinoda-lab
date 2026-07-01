@@ -1,0 +1,27 @@
+---
+description: Rules for the asr-error-modeling project
+globs: "asr-error-modeling/**"
+alwaysApply: true
+---
+
+# ASR Error Modeling Project Rules
+
+## Project Overview
+
+This project is a research project on ASR error modeling.
+The main goals are:
+1. To convert the ASR output on clean speech to the ASR output on noisy speech.
+2. To convert the ASR output on noisy speech to the ASR output on clean speech.
+
+## Virtual Environment Usage
+
+When executing commands in the terminal, always activate the environment first:
+```bash
+source ./.venv/nemo_asr_env/bin/activate
+```
+
+## Database Usage
+
+In this project, I use DuckDB as the database.
+The DuckDB file is located in the data/sql/ directory.
+When you write Python code to connect to the database, you MUST ALWAYS use **read-only mode** to prevent accidental data corruption.
