@@ -14,7 +14,7 @@ def get_noise_option(
 ) -> dict:
     rows = con.execute(
         """
-        SELECT config_json FROM noise_config WHERE id = ?
+        SELECT config_json FROM noise_configs WHERE id = ?
         """,
         [noise_config_id],
     ).fetchone()
@@ -45,9 +45,9 @@ class NoiseGenerator:
         settings: dict,
     ):
         self.settings = settings
-        match settings['generator_name']:
-            case 'audiofile_only':
-                self.generator = OptionControlNoiseGenerator(settings)
+        match settings['generator_type']:
+            case 'additive':
+                self.generator = AdditiveNoiseGenerator(settings)
             case _:
                 raise NotImplementedError(f'Noise type {settings["type"]} not implemented')
 
@@ -62,7 +62,7 @@ class NoiseGenerator:
         )
 
 
-class OptionControlNoiseGenerator:
+class AdditiveNoiseGenerator:
     def __init__(
         self,
         settings: dict,

@@ -19,20 +19,20 @@ from src.utils.sql import check_table_exists
 def create_noise_config_table_if_needed(
     con: db.DuckDBPyConnection,
 ) -> None:
-    if check_table_exists(con, 'noise_config'):
-        print_warning("noise_config table already exists. Skip creating 'noise_config' table.")
+    if check_table_exists(con, 'noise_configs'):
+        print_warning("noise_configs table already exists. Skip creating 'noise_configs' table.")
         return
 
     con.execute(
         """
-        CREATE SEQUENCE noise_config_id_seq START 1;
+        CREATE SEQUENCE noise_configs_id_seq START 1;
         """
     )
 
     con.execute(
         """
-        CREATE TABLE noise_config (
-            id             INTEGER PRIMARY KEY DEFAULT nextval('noise_config_id_seq'),
+        CREATE TABLE noise_configs (
+            id             INTEGER PRIMARY KEY DEFAULT nextval('noise_configs_id_seq'),
             config_json    JSON NOT NULL,
 
             UNIQUE (

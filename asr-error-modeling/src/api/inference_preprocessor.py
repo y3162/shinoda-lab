@@ -99,7 +99,7 @@ class InferencePreprocessor(ABC):
     def dataloader_defaults(
         self,
     ) -> DataLoaderDefaults:
-        return DataLoaderDefaults(batch_size=32, num_workers=16)
+        return DataLoaderDefaults(batch_size=128, num_workers=8)
 
     def create_dataloader(
         self,

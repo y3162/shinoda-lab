@@ -19,7 +19,7 @@ def insert_noise_config(
     con: db.DuckDBPyConnection,
 ) -> None:
     insert_sql = """
-        INSERT OR IGNORE INTO noise_config (
+        INSERT OR IGNORE INTO noise_configs (
             config_json
         )
         VALUES (?)
@@ -34,10 +34,10 @@ def insert_noise_config(
     ).fetchall()
 
     con.execute('BEGIN TRANSACTION')
-    with tqdm(desc='Inserted noise_config', unit='rows') as pbar:
+    with tqdm(desc='Inserted noise_configs', unit='rows') as pbar:
         con.execute(insert_sql, [json.dumps(
             {
-                'generator_name': 'audiofile_only',
+                'generator_type': 'additive',
                 'args': [],
             }
         )])
@@ -45,7 +45,7 @@ def insert_noise_config(
             for snr in range(-10, 5+1):
                 con.execute(insert_sql, [json.dumps(
                     {
-                        'generator_name': 'audiofile_only',
+                        'generator_type': 'additive',
                         'args': [
                             {
                                 'type': 'audiofile',
