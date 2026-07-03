@@ -1,0 +1,21 @@
+---
+description: Rules for the speech-enhancement project
+globs: "speech-enhancement/**"
+alwaysApply: true
+---
+
+# Speech Enhancement Project Rules
+
+## Project Overview
+
+This project is a research project on speech enhancement.
+The main goals are:
+1. To estimate the clean speech from the noisy speech.
+
+## Virtual Environment Usage
+
+When executing commands in the terminal, always activate the environment first:
+```bash
+# if using MP-SENet
+source ./.venv/mp_senet_env/bin/activate
+```

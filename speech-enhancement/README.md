@@ -1,13 +1,15 @@
 ## Virtual Environment Setup
 
-### Environment Activation
+### MP-SENet
+
+#### Environment Activation
 
 ```bash
-uv venv ./.venv/base_env --python 3.10
-source ./.venv/base_env/bin/activate
+uv venv ./.venv/mp_senet_env --python 3.10
+source ./.venv/mp_senet_env/bin/activate
 ```
 
-### Install Dependencies
+#### Install Dependencies
 
 ```bash
 uv pip install \
@@ -22,6 +24,16 @@ uv pip install \
     duckdb \
     duckdb-cli \
     "setuptools<82" \
+      numpy \
+    librosa \
+    scipy \
+    tensorboard \
+    matplotlib \
+    SoundFile \
+    einops \
+    joblib \
+    natsort \
+    pesq \
     --index-url https://download.pytorch.org/whl/cu124 \
     --extra-index-url https://pypi.org/simple
 ```
@@ -34,6 +46,14 @@ uv pip install \
 
 ```bash
 ln -s /path/to/librispeech data/raw/
+```
+
+### Noisy Speech Dataset
+
+- [ ] [VoiceBank + DEMAND](https://datashare.ed.ac.uk/items/6ed35425-bf14-4d2b-93a1-0a4984952757)
+
+```bash
+ln -s /path/to/voicebank+demand data/raw/
 ```
 
 ### Noise Dataset

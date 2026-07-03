@@ -1,5 +1,7 @@
 __pycache__/
 
+TODO.md
+
 .venv/
 data/
 commands/
