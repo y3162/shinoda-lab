@@ -6,6 +6,12 @@
 | :--- | :--- | :--- |
 | [stft.md](./20260704_stft.md) | 2023 | Discrete Fourier Transform |
 
+## Speech Enhancement
+
+| markdown | year | title |
+| :--- | :--- | :--- |
+| [MP-SENet.md](./20260704_MP-SENet.md) | 2023 | [MP-SENet: A Speech Enhancement Model with Parallel Denoising of Magnitude and Phase Spectra](https://arxiv.org/abs/2305.13686) |
+
 # Natural Language Processing
 
 ## Large Language Models
