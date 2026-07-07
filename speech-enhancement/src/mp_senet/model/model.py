@@ -228,12 +228,10 @@ class MPNet(nn.Module):
 
         self.h = h
 
-        # 元コードの属性名を維持
         self.num_tscblocks = num_tsblocks
 
         self.dense_encoder = DenseEncoder(h, in_channel=2)
 
-        # 元コードの属性名を維持
         self.TSTransformer = nn.ModuleList(
             [TSTransformerBlock(h) for _ in range(num_tsblocks)]
         )

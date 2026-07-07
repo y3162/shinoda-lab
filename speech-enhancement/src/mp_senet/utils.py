@@ -48,7 +48,6 @@ class LearnableSigmoid1d(nn.Module):
         self.beta = beta
         self.slope = nn.Parameter(torch.ones(in_features))
 
-        # 元コードの記述を維持
         self.slope.requiresGrad = True
 
     def forward(self, x):
@@ -62,7 +61,6 @@ class LearnableSigmoid2d(nn.Module):
         self.beta = beta
         self.slope = nn.Parameter(torch.ones(in_features, 1))
 
-        # 元コードの記述を維持
         self.slope.requiresGrad = True
 
     def forward(self, x):
