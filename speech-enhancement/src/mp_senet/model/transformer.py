@@ -21,6 +21,7 @@ class FFN(nn.Module):
             hidden_size=hidden_size,
             num_layers=1,
             bidirectional=bidirectional,
+            batch_first=True,
         )
 
         linear_in_dim = hidden_size * 2 if bidirectional else hidden_size
@@ -48,6 +49,7 @@ class TransformerBlock(nn.Module):
             embed_dim=d_model,
             num_heads=n_heads,
             dropout=dropout,
+            batch_first=True,
         )
         self.dropout1 = Dropout(dropout)
 
