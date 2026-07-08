@@ -408,9 +408,6 @@ def train(rank, a, h):
             )
 
         for batch in train_iter:
-            if rank == 0:
-                start_b = time.time()
-
             clean_audio, noisy_audio = batch
             clean_audio = clean_audio.to(device, non_blocking=True)
             noisy_audio = noisy_audio.to(device, non_blocking=True)
@@ -497,7 +494,6 @@ def train(rank, a, h):
                         com=com_error,
                         time=time_error,
                         stft=stft_error,
-                        s_b=time.time() - start_b,
                     ),
                     refresh=False,
                 )
@@ -605,10 +601,9 @@ def train(rank, a, h):
                             )
                         )
                         logger.info(
-                            'Steps: %d, PESQ Score: %.3f, s/b: %.3f',
+                            'Steps: %d, PESQ Score: %.3f',
                             steps,
                             val_pesq_score,
-                            time.time() - start_b,
                         )
                         train_iter.set_postfix(
                             format_postfix(
@@ -621,7 +616,6 @@ def train(rank, a, h):
                                 com=com_error,
                                 time=time_error,
                                 stft=stft_error,
-                                s_b=time.time() - start_b,
                                 pesq=val_pesq_score,
                             ),
                             refresh=False,
