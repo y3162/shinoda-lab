@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DistributedSampler, DataLoader
-from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import init_process_group, destroy_process_group, barrier
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
@@ -158,6 +158,66 @@ def mag_pha_istft(mag, pha, n_fft, hop_size, win_size, compress_factor=1.0, cent
         center=center,
     )
     return wav
+
+
+def forward_generator_batch(generator, clean_audio, noisy_audio, h):
+    clean_mag, clean_pha, clean_com = mag_pha_stft(
+        clean_audio, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
+    )
+    noisy_mag, noisy_pha, _ = mag_pha_stft(
+        noisy_audio, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
+    )
+
+    mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
+
+    audio_g = mag_pha_istft(
+        mag_g, pha_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
+    )
+    mag_g_hat, _, com_g_hat = mag_pha_stft(
+        audio_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
+    )
+
+    return {
+        'clean_mag': clean_mag,
+        'clean_pha': clean_pha,
+        'clean_com': clean_com,
+        'noisy_mag': noisy_mag,
+        'noisy_pha': noisy_pha,
+        'mag_g': mag_g,
+        'pha_g': pha_g,
+        'com_g': com_g,
+        'audio_g': audio_g,
+        'mag_g_hat': mag_g_hat,
+        'com_g_hat': com_g_hat,
+    }
+
+
+def compute_reconstruction_errors(
+    clean_mag,
+    clean_pha,
+    clean_com,
+    mag_g,
+    pha_g,
+    com_g,
+    com_g_hat,
+    clean_audio=None,
+    audio_g=None,
+):
+    mag_error = F.mse_loss(clean_mag, mag_g).item()
+    ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g)
+    pha_error = (ip_error + gd_error + iaf_error).item()
+    com_error = F.mse_loss(clean_com, com_g).item()
+    stft_error = F.mse_loss(com_g, com_g_hat).item()
+
+    errors = {
+        'mag_error': mag_error,
+        'pha_error': pha_error,
+        'com_error': com_error,
+        'stft_error': stft_error,
+    }
+    if clean_audio is not None and audio_g is not None:
+        errors['time_error'] = F.l1_loss(clean_audio, audio_g).item()
+    return errors
 
 
 def get_dataset_filelist(a):
@@ -373,61 +433,40 @@ def train(rank, a, h):
     best_pesq = 0
     epoch = last_epoch
 
-    epoch_range = range(max(0, last_epoch), a.training_epochs)
-    if rank == 0:
-        epoch_pbar = tqdm(
-            epoch_range,
-            desc='Epochs',
-            unit='epoch',
-            position=0,
-            dynamic_ncols=True,
-        )
-    else:
-        epoch_pbar = epoch_range
-
-    for epoch in epoch_pbar:
+    for epoch in range(max(0, last_epoch), a.training_epochs):
         if rank == 0:
             start = time.time()
-            epoch_pbar.set_description(
-                'Epoch {}/{}'.format(epoch + 1, a.training_epochs)
-            )
             logger.info('Epoch: %d', epoch + 1)
 
         if h.num_gpus > 1:
             train_sampler.set_epoch(epoch)
 
-        train_iter = train_loader
         if rank == 0:
-            train_iter = tqdm(
-                train_loader,
-                desc='Train',
-                unit='batch',
-                leave=False,
-                position=1,
+            train_pbar = tqdm(
+                total=len(train_loader) * h.batch_size,
+                unit='sample',
+                desc='Epoch {}/{}'.format(epoch + 1, a.training_epochs),
                 dynamic_ncols=True,
             )
+        else:
+            train_pbar = None
 
-        for batch in train_iter:
+        for batch in train_loader:
             clean_audio, noisy_audio = batch
             clean_audio = clean_audio.to(device, non_blocking=True)
             noisy_audio = noisy_audio.to(device, non_blocking=True)
             one_labels = torch.ones(h.batch_size).to(device, non_blocking=True)
 
-            clean_mag, clean_pha, clean_com = mag_pha_stft(
-                clean_audio, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
-            )
-            noisy_mag, noisy_pha, _ = mag_pha_stft(
-                noisy_audio, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
-            )
-
-            mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
-
-            audio_g = mag_pha_istft(
-                mag_g, pha_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
-            )
-            mag_g_hat, _, com_g_hat = mag_pha_stft(
-                audio_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
-            )
+            outputs = forward_generator_batch(generator, clean_audio, noisy_audio, h)
+            clean_mag = outputs['clean_mag']
+            clean_pha = outputs['clean_pha']
+            clean_com = outputs['clean_com']
+            mag_g = outputs['mag_g']
+            pha_g = outputs['pha_g']
+            com_g = outputs['com_g']
+            audio_g = outputs['audio_g']
+            mag_g_hat = outputs['mag_g_hat']
+            com_g_hat = outputs['com_g_hat']
 
             audio_list_r, audio_list_g = (
                 list(clean_audio.cpu().numpy()),
@@ -476,27 +515,22 @@ def train(rank, a, h):
             if rank == 0:
                 with torch.no_grad():
                     metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
-                    mag_error = F.mse_loss(clean_mag, mag_g).item()
-                    ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g)
-                    pha_error = (ip_error + gd_error + iaf_error).item()
-                    com_error = F.mse_loss(clean_com, com_g).item()
-                    time_error = F.l1_loss(clean_audio, audio_g).item()
-                    stft_error = F.mse_loss(com_g, com_g_hat).item()
-
-                train_iter.set_postfix(
-                    format_postfix(
-                        step=steps,
-                        gen=float(loss_gen_all),
-                        disc=float(loss_disc_all),
-                        metric=metric_error,
-                        mag=mag_error,
-                        pha=pha_error,
-                        com=com_error,
-                        time=time_error,
-                        stft=stft_error,
-                    ),
-                    refresh=False,
-                )
+                    errors = compute_reconstruction_errors(
+                        clean_mag,
+                        clean_pha,
+                        clean_com,
+                        mag_g,
+                        pha_g,
+                        com_g,
+                        com_g_hat,
+                        clean_audio=clean_audio,
+                        audio_g=audio_g,
+                    )
+                    mag_error = errors['mag_error']
+                    pha_error = errors['pha_error']
+                    com_error = errors['com_error']
+                    stft_error = errors['stft_error']
+                    time_error = errors['time_error']
 
                 if steps % a.checkpoint_interval == 0 and steps != 0:
                     save_latest_checkpoint(
@@ -522,168 +556,117 @@ def train(rank, a, h):
                     sw.add_scalar("Training/Time Loss", time_error, steps)
                     sw.add_scalar("Training/Consistency Loss", stft_error, steps)
 
-                if steps % a.validation_interval == 0 and steps != 0:
-                    generator.eval()
-                    torch.cuda.empty_cache()
-                    audios_r, audios_g = [], []
-                    val_mag_err_tot = 0
-                    val_pha_err_tot = 0
-                    val_com_err_tot = 0
-                    val_stft_err_tot = 0
-                    with torch.no_grad():
-                        val_iter = tqdm(
-                            validation_loader,
-                            desc='Validation',
-                            unit='utt',
-                            leave=False,
-                            position=2,
-                            dynamic_ncols=True,
-                        )
-                        for j, batch in enumerate(val_iter):
-                            clean_audio, noisy_audio = batch
-                            clean_audio = clean_audio.to(device, non_blocking=True)
-                            noisy_audio = noisy_audio.to(device, non_blocking=True)
-
-                            clean_mag, clean_pha, clean_com = mag_pha_stft(
-                                clean_audio,
-                                h.n_fft,
-                                h.hop_size,
-                                h.win_size,
-                                h.compress_factor,
-                            )
-                            noisy_mag, noisy_pha, _ = mag_pha_stft(
-                                noisy_audio,
-                                h.n_fft,
-                                h.hop_size,
-                                h.win_size,
-                                h.compress_factor,
-                            )
-
-                            mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
-
-                            audio_g = mag_pha_istft(
-                                mag_g,
-                                pha_g,
-                                h.n_fft,
-                                h.hop_size,
-                                h.win_size,
-                                h.compress_factor,
-                            )
-                            _, _, com_g_hat = mag_pha_stft(
-                                audio_g,
-                                h.n_fft,
-                                h.hop_size,
-                                h.win_size,
-                                h.compress_factor,
-                            )
-                            audios_r += torch.split(clean_audio, 1, dim=0)
-                            audios_g += torch.split(audio_g, 1, dim=0)
-
-                            val_mag_err_tot += F.mse_loss(clean_mag, mag_g).item()
-                            val_ip_err, val_gd_err, val_iaf_err = phase_losses(
-                                clean_pha, pha_g
-                            )
-                            val_pha_err_tot += (
-                                val_ip_err + val_gd_err + val_iaf_err
-                            ).item()
-                            val_com_err_tot += F.mse_loss(clean_com, com_g).item()
-                            val_stft_err_tot += F.mse_loss(com_g, com_g_hat).item()
-
-                        val_mag_err = val_mag_err_tot / (j + 1)
-                        val_pha_err = val_pha_err_tot / (j + 1)
-                        val_com_err = val_com_err_tot / (j + 1)
-                        val_stft_err = val_stft_err_tot / (j + 1)
-                        val_pesq_score = pesq_score(audios_r, audios_g, h).item()
-                        tqdm.write(
-                            'Steps: {}, PESQ Score: {:.3f}'.format(
-                                steps,
-                                val_pesq_score,
-                            )
-                        )
-                        logger.info(
-                            'Steps: %d, PESQ Score: %.3f',
-                            steps,
-                            val_pesq_score,
-                        )
-                        train_iter.set_postfix(
-                            format_postfix(
-                                step=steps,
-                                gen=float(loss_gen_all),
-                                disc=float(loss_disc_all),
-                                metric=metric_error,
-                                mag=mag_error,
-                                pha=pha_error,
-                                com=com_error,
-                                time=time_error,
-                                stft=stft_error,
-                                pesq=val_pesq_score,
-                            ),
-                            refresh=False,
-                        )
-                        sw.add_scalar("Validation/PESQ Score", val_pesq_score, steps)
-                        sw.add_scalar("Validation/Magnitude Loss", val_mag_err, steps)
-                        sw.add_scalar("Validation/Phase Loss", val_pha_err, steps)
-                        sw.add_scalar("Validation/Complex Loss", val_com_err, steps)
-                        sw.add_scalar(
-                            "Validation/Consistency Loss",
-                            val_stft_err,
-                            steps,
-                        )
-
-                    if epoch >= a.best_checkpoint_start_epoch:
-                        if val_pesq_score > best_pesq:
-                            best_pesq = val_pesq_score
-                            save_best_checkpoint(
-                                a.checkpoint_path,
-                                generator,
-                                h.num_gpus,
-                            )
-                            tqdm.write(
-                                'Updated best checkpoint (PESQ={:.3f}) at step {}'.format(
-                                    best_pesq,
-                                    steps,
-                                )
-                            )
-                            logger.info(
-                                'Updated best checkpoint (PESQ=%.3f) at step %d',
-                                best_pesq,
-                                steps,
-                            )
-
-                    generator.train()
-
             steps += 1
 
-            if a.max_steps is not None and steps >= a.max_steps:
-                if rank == 0:
-                    tqdm.write(
-                        'Reached max_steps={}. Stopping training.'.format(
-                            a.max_steps,
-                        )
+            if rank == 0:
+                train_pbar.set_postfix(
+                    format_postfix(
+                        step=steps,
+                        gen=float(loss_gen_all),
+                        disc=float(loss_disc_all),
+                        metric=metric_error,
+                        mag=mag_error,
+                        pha=pha_error,
+                        com=com_error,
+                        time=time_error,
+                        stft=stft_error,
+                    ),
+                    refresh=False,
+                )
+                train_pbar.update(h.batch_size)
+
+        if rank == 0:
+            train_pbar.close()
+
+        if rank == 0:
+            generator.eval()
+            torch.cuda.empty_cache()
+            audios_r, audios_g = [], []
+            val_mag_err_tot = 0
+            val_pha_err_tot = 0
+            val_com_err_tot = 0
+            val_stft_err_tot = 0
+            with torch.no_grad():
+                for j, batch in enumerate(validation_loader):
+                    clean_audio, noisy_audio = batch
+                    clean_audio = clean_audio.to(device, non_blocking=True)
+                    noisy_audio = noisy_audio.to(device, non_blocking=True)
+
+                    outputs = forward_generator_batch(
+                        generator, clean_audio, noisy_audio, h,
                     )
-                    logger.info(
-                        'Reached max_steps=%d. Stopping training.',
-                        a.max_steps,
+                    errors = compute_reconstruction_errors(
+                        outputs['clean_mag'],
+                        outputs['clean_pha'],
+                        outputs['clean_com'],
+                        outputs['mag_g'],
+                        outputs['pha_g'],
+                        outputs['com_g'],
+                        outputs['com_g_hat'],
                     )
-                break
+                    audios_r += torch.split(clean_audio, 1, dim=0)
+                    audios_g += torch.split(outputs['audio_g'], 1, dim=0)
+
+                    val_mag_err_tot += errors['mag_error']
+                    val_pha_err_tot += errors['pha_error']
+                    val_com_err_tot += errors['com_error']
+                    val_stft_err_tot += errors['stft_error']
+
+            val_mag_err = val_mag_err_tot / (j + 1)
+            val_pha_err = val_pha_err_tot / (j + 1)
+            val_com_err = val_com_err_tot / (j + 1)
+            val_stft_err = val_stft_err_tot / (j + 1)
+            val_pesq_score = pesq_score(audios_r, audios_g, h).item()
+
+            val_message = (
+                'Validation (epoch {}/{}): PESQ={:.3f}, mag={:.3f}, '
+                'pha={:.3f}, com={:.3f}, stft={:.3f}'
+            ).format(
+                epoch + 1,
+                a.training_epochs,
+                val_pesq_score,
+                val_mag_err,
+                val_pha_err,
+                val_com_err,
+                val_stft_err,
+            )
+            tqdm.write(val_message)
+            logger.info(val_message)
+
+            sw.add_scalar("Validation/PESQ Score", val_pesq_score, epoch + 1)
+            sw.add_scalar("Validation/Magnitude Loss", val_mag_err, epoch + 1)
+            sw.add_scalar("Validation/Phase Loss", val_pha_err, epoch + 1)
+            sw.add_scalar("Validation/Complex Loss", val_com_err, epoch + 1)
+            sw.add_scalar("Validation/Consistency Loss", val_stft_err, epoch + 1)
+
+            if val_pesq_score > best_pesq:
+                best_pesq = val_pesq_score
+                save_best_checkpoint(
+                    a.checkpoint_path,
+                    generator,
+                    h.num_gpus,
+                )
+                best_message = (
+                    'Updated best checkpoint (PESQ={:.3f}) at epoch {}'
+                ).format(best_pesq, epoch + 1)
+                tqdm.write(best_message)
+                logger.info(best_message)
+
+            generator.train()
+
+        if h.num_gpus > 1:
+            barrier()
 
         scheduler_g.step()
         scheduler_d.step()
 
         if rank == 0:
             epoch_time = int(time.time() - start)
-            epoch_pbar.set_postfix(
-                format_postfix(epoch_time_sec=epoch_time),
-                refresh=False,
-            )
             logger.info(
                 'Time taken for epoch %d is %d sec',
                 epoch + 1,
                 epoch_time,
             )
-
-        if a.max_steps is not None and steps >= a.max_steps:
-            break
 
     if rank == 0 and steps > 0:
         save_latest_checkpoint(
@@ -735,14 +718,6 @@ def main():
     parser.add_argument('--training_epochs', default=400, type=int)
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
-    parser.add_argument('--validation_interval', default=5000, type=int)
-    parser.add_argument('--best_checkpoint_start_epoch', default=40, type=int)
-    parser.add_argument(
-        '--max_steps',
-        default=None,
-        type=int,
-        help='Stop training after this many steps (for smoke tests).',
-    )
     parser.add_argument(
         '--num_workers',
         default=None,
