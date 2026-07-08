@@ -1,44 +1,15 @@
 import os
-import glob
+
+import numpy as np
 import torch
 import torch.nn as nn
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pylab as plt
+from pesq import pesq
 
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super(AttrDict, self).__init__(*args, **kwargs)
         self.__dict__ = self
-
-
-def plot_spectrogram(spectrogram):
-    fig, ax = plt.subplots(figsize=(4, 3))
-
-    im = ax.imshow(
-        spectrogram,
-        aspect="auto",
-        origin="lower",
-        interpolation="none",
-    )
-    plt.colorbar(im, ax=ax)
-
-    fig.canvas.draw()
-    plt.close()
-
-    return fig
-
-
-def get_padding(kernel_size, dilation=1):
-    return int((kernel_size * dilation - dilation) / 2)
-
-
-def get_padding_2d(kernel_size, dilation=(1, 1)):
-    padding_h = int((kernel_size[0] * dilation[0] - dilation[0]) / 2)
-    padding_w = int((kernel_size[1] * dilation[1] - dilation[1]) / 2)
-
-    return padding_h, padding_w
 
 
 class LearnableSigmoid1d(nn.Module):
@@ -67,53 +38,41 @@ class LearnableSigmoid2d(nn.Module):
         return self.beta * torch.sigmoid(self.slope * x)
 
 
-class Sigmoid2d(nn.Module):
-    def __init__(self, in_features, beta=1):
-        super().__init__()
-
-        self.beta = beta
-        self.slope = torch.ones(in_features, 1)
-
-    def forward(self, x):
-        return self.beta * torch.sigmoid(self.slope * x)
-
-
-class PLSigmoid(nn.Module):
-    def __init__(self, in_features):
-        super().__init__()
-
-        self.beta = nn.Parameter(torch.ones(in_features, 1) * 2.0)
-        self.slope = nn.Parameter(torch.ones(in_features, 1))
-
-        # 元コードの記述を維持
-        self.beta.requiresGrad = True
-        self.slope.requiresGrad = True
-
-    def forward(self, x):
-        return self.beta * torch.sigmoid(self.slope * x)
-
-
 def load_checkpoint(filepath, device):
     assert os.path.isfile(filepath)
-
-    print("Loading '{}'".format(filepath))
-    checkpoint_dict = torch.load(filepath, map_location=device)
-    print("Complete.")
-
-    return checkpoint_dict
+    return torch.load(filepath, map_location=device)
 
 
 def save_checkpoint(filepath, obj):
-    print("Saving checkpoint to {}".format(filepath))
     torch.save(obj, filepath)
-    print("Complete.")
 
 
-def scan_checkpoint(cp_dir, prefix):
-    pattern = os.path.join(cp_dir, prefix + "????????")
-    checkpoint_paths = glob.glob(pattern)
+def cal_pesq(clean, noisy, sr=16000):
+    try:
+        score = pesq(sr, clean, noisy, 'wb')
+    except Exception:
+        score = -1
+    return score
 
-    if len(checkpoint_paths) == 0:
+
+def batch_pesq(clean, noisy):
+    scores = np.array([
+        cal_pesq(clean_utt, noisy_utt)
+        for clean_utt, noisy_utt in zip(clean, noisy)
+    ])
+    if -1 in scores:
         return None
+    scores = (scores - 1) / 3.5
+    return torch.FloatTensor(scores)
 
-    return sorted(checkpoint_paths)[-1]
+
+def pesq_score(utts_r, utts_g, h):
+    scores = [
+        cal_pesq(
+            utts_r[i].squeeze().cpu().numpy(),
+            utts_g[i].squeeze().cpu().numpy(),
+            h.sampling_rate,
+        )
+        for i in range(len(utts_r))
+    ]
+    return np.mean(scores)

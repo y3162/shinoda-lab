@@ -3,8 +3,6 @@ import torch.nn as nn
 import numpy as np
 from src.mp_senet.model.transformer import TransformerBlock
 from src.mp_senet.utils import LearnableSigmoid2d
-from pesq import pesq
-from joblib import Parallel, delayed
 
 
 class SPConvTranspose2d(nn.Module):
@@ -289,25 +287,3 @@ def phase_losses(phase_r, phase_g):
     )
 
     return ip_loss, gd_loss, iaf_loss
-
-
-def eval_pesq(clean_utt, esti_utt, sr):
-    try:
-        pesq_score = pesq(sr, clean_utt, esti_utt)
-    except:
-        pesq_score = -1
-
-    return pesq_score
-
-
-def pesq_score(utts_r, utts_g, h):
-    scores = Parallel(n_jobs=30)(
-        delayed(eval_pesq)(
-            utts_r[i].squeeze().cpu().numpy(),
-            utts_g[i].squeeze().cpu().numpy(),
-            h.sampling_rate,
-        )
-        for i in range(len(utts_r))
-    )
-
-    return np.mean(scores)

@@ -20,30 +20,19 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
-import numpy as np
-from pesq import pesq
-
 from src.mp_senet.model.model import MPNet, phase_losses
 from src.mp_senet.model.discriminator import MetricDiscriminator
 from src.mp_senet.utils import (
     AttrDict,
-    scan_checkpoint,
     load_checkpoint,
     save_checkpoint,
+    batch_pesq,
+    pesq_score,
 )
 
 torch.backends.cudnn.benchmark = True
 
 CHECKPOINT_ROOT = 'data/checkpoints/mp_senet'
-
-
-class TqdmLoggingHandler(logging.Handler):
-    def emit(self, record):
-        try:
-            tqdm.write(self.format(record))
-            self.flush()
-        except Exception:
-            self.handleError(record)
 
 
 def setup_logging(log_dir, rank=0):
@@ -66,53 +55,63 @@ def setup_logging(log_dir, rank=0):
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    stream_handler = TqdmLoggingHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-
     return logger
+
+
+def format_postfix(**kwargs):
+    formatted = {}
+    for key, value in kwargs.items():
+        if isinstance(value, float):
+            formatted[key] = f'{value:.3f}'
+        else:
+            formatted[key] = value
+    return formatted
 
 
 def resolve_checkpoint_path(checkpoint_root):
     if os.path.isdir(checkpoint_root):
-        cp_g = scan_checkpoint(checkpoint_root, 'g_')
-        cp_do = scan_checkpoint(checkpoint_root, 'do_')
-        if cp_g is not None and cp_do is not None:
+        cp_g = os.path.join(checkpoint_root, 'g_latest')
+        cp_do = os.path.join(checkpoint_root, 'do_latest')
+        if os.path.isfile(cp_g) and os.path.isfile(cp_do):
             return checkpoint_root
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     return os.path.join(checkpoint_root, timestamp)
 
 
-def cal_pesq(clean, noisy, sr=16000):
-    try:
-        score = pesq(sr, clean, noisy, 'wb')
-    except Exception:
-        score = -1
-    return score
+def latest_checkpoint_paths(checkpoint_dir):
+    cp_g = os.path.join(checkpoint_dir, 'g_latest')
+    cp_do = os.path.join(checkpoint_dir, 'do_latest')
+    if os.path.isfile(cp_g) and os.path.isfile(cp_do):
+        return cp_g, cp_do
+    return None, None
 
 
-def batch_pesq(clean, noisy):
-    scores = np.array([
-        cal_pesq(clean_utt, noisy_utt)
-        for clean_utt, noisy_utt in zip(clean, noisy)
-    ])
-    if -1 in scores:
-        return None
-    scores = (scores - 1) / 3.5
-    return torch.FloatTensor(scores)
+def save_latest_checkpoint(checkpoint_path, generator, discriminator, optim_g, optim_d, steps, epoch, num_gpus):
+    gen = generator.module if num_gpus > 1 else generator
+    disc = discriminator.module if num_gpus > 1 else discriminator
+    save_checkpoint(
+        os.path.join(checkpoint_path, 'g_latest'),
+        {'generator': gen.state_dict()},
+    )
+    save_checkpoint(
+        os.path.join(checkpoint_path, 'do_latest'),
+        {
+            'discriminator': disc.state_dict(),
+            'optim_g': optim_g.state_dict(),
+            'optim_d': optim_d.state_dict(),
+            'steps': steps,
+            'epoch': epoch,
+        },
+    )
 
 
-def pesq_score(utts_r, utts_g, h):
-    scores = [
-        cal_pesq(
-            utts_r[i].squeeze().cpu().numpy(),
-            utts_g[i].squeeze().cpu().numpy(),
-            h.sampling_rate,
-        )
-        for i in range(len(utts_r))
-    ]
-    return np.mean(scores)
+def save_best_checkpoint(checkpoint_path, generator, num_gpus):
+    gen = generator.module if num_gpus > 1 else generator
+    save_checkpoint(
+        os.path.join(checkpoint_path, 'g_best'),
+        {'generator': gen.state_dict()},
+    )
 
 
 def build_env(config, config_name, path):
@@ -189,8 +188,6 @@ class Dataset(torch.utils.data.Dataset):
         sampling_rate,
         split=True,
         shuffle=True,
-        n_cache_reuse=1,
-        device=None,
     ):
         self.audio_indexes = training_indexes
         random.seed(1234)
@@ -201,32 +198,19 @@ class Dataset(torch.utils.data.Dataset):
         self.segment_size = segment_size
         self.sampling_rate = sampling_rate
         self.split = split
-        self.cached_clean_wav = None
-        self.cached_noisy_wav = None
-        self.n_cache_reuse = n_cache_reuse
-        self._cache_ref_count = 0
-        self.device = device
 
     def __getitem__(self, index):
         filename = self.audio_indexes[index]
-        if self._cache_ref_count == 0:
-            clean_audio, _ = librosa.load(
-                os.path.join(self.clean_wavs_dir, filename + '.wav'),
-                sr=self.sampling_rate,
-            )
-            noisy_audio, _ = librosa.load(
-                os.path.join(self.noisy_wavs_dir, filename + '.wav'),
-                sr=self.sampling_rate,
-            )
-            length = min(len(clean_audio), len(noisy_audio))
-            clean_audio, noisy_audio = clean_audio[:length], noisy_audio[:length]
-            self.cached_clean_wav = clean_audio
-            self.cached_noisy_wav = noisy_audio
-            self._cache_ref_count = self.n_cache_reuse
-        else:
-            clean_audio = self.cached_clean_wav
-            noisy_audio = self.cached_noisy_wav
-            self._cache_ref_count -= 1
+        clean_audio, _ = librosa.load(
+            os.path.join(self.clean_wavs_dir, filename + '.wav'),
+            sr=self.sampling_rate,
+        )
+        noisy_audio, _ = librosa.load(
+            os.path.join(self.noisy_wavs_dir, filename + '.wav'),
+            sr=self.sampling_rate,
+        )
+        length = min(len(clean_audio), len(noisy_audio))
+        clean_audio, noisy_audio = clean_audio[:length], noisy_audio[:length]
 
         clean_audio, noisy_audio = (
             torch.FloatTensor(clean_audio),
@@ -292,8 +276,7 @@ def train(rank, a, h):
     cp_g = None
     cp_do = None
     if os.path.isdir(a.checkpoint_path):
-        cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
-        cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
+        cp_g, cp_do = latest_checkpoint_paths(a.checkpoint_path)
 
     steps = 0
     if cp_g is None or cp_do is None:
@@ -346,9 +329,7 @@ def train(rank, a, h):
         h.segment_size,
         h.sampling_rate,
         split=True,
-        n_cache_reuse=0,
         shuffle=False if h.num_gpus > 1 else True,
-        device=device,
     )
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
@@ -372,8 +353,6 @@ def train(rank, a, h):
             h.sampling_rate,
             split=False,
             shuffle=False,
-            n_cache_reuse=0,
-            device=device,
         )
 
         validation_loader = DataLoader(
@@ -392,19 +371,26 @@ def train(rank, a, h):
     discriminator.train()
 
     best_pesq = 0
+    epoch = last_epoch
 
     epoch_range = range(max(0, last_epoch), a.training_epochs)
     if rank == 0:
-        epoch_range = tqdm(
+        epoch_pbar = tqdm(
             epoch_range,
             desc='Epochs',
             unit='epoch',
             position=0,
+            dynamic_ncols=True,
         )
+    else:
+        epoch_pbar = epoch_range
 
-    for epoch in epoch_range:
+    for epoch in epoch_pbar:
         if rank == 0:
             start = time.time()
+            epoch_pbar.set_description(
+                'Epoch {}/{}'.format(epoch + 1, a.training_epochs)
+            )
             logger.info('Epoch: %d', epoch + 1)
 
         if h.num_gpus > 1:
@@ -414,25 +400,26 @@ def train(rank, a, h):
         if rank == 0:
             train_iter = tqdm(
                 train_loader,
-                desc='Epoch {}/{}'.format(epoch + 1, a.training_epochs),
-                unit='step',
+                desc='Train',
+                unit='batch',
                 leave=False,
                 position=1,
+                dynamic_ncols=True,
             )
 
-        for i, batch in enumerate(train_iter):
+        for batch in train_iter:
             if rank == 0:
                 start_b = time.time()
 
             clean_audio, noisy_audio = batch
-            clean_audio = torch.autograd.Variable(clean_audio.to(device, non_blocking=True))
-            noisy_audio = torch.autograd.Variable(noisy_audio.to(device, non_blocking=True))
+            clean_audio = clean_audio.to(device, non_blocking=True)
+            noisy_audio = noisy_audio.to(device, non_blocking=True)
             one_labels = torch.ones(h.batch_size).to(device, non_blocking=True)
 
             clean_mag, clean_pha, clean_com = mag_pha_stft(
                 clean_audio, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
             )
-            noisy_mag, noisy_pha, noisy_com = mag_pha_stft(
+            noisy_mag, noisy_pha, _ = mag_pha_stft(
                 noisy_audio, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
             )
 
@@ -441,7 +428,7 @@ def train(rank, a, h):
             audio_g = mag_pha_istft(
                 mag_g, pha_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
             )
-            mag_g_hat, pha_g_hat, com_g_hat = mag_pha_stft(
+            mag_g_hat, _, com_g_hat = mag_pha_stft(
                 audio_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
             )
 
@@ -490,69 +477,44 @@ def train(rank, a, h):
             optim_g.step()
 
             if rank == 0:
+                with torch.no_grad():
+                    metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
+                    mag_error = F.mse_loss(clean_mag, mag_g).item()
+                    ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g)
+                    pha_error = (ip_error + gd_error + iaf_error).item()
+                    com_error = F.mse_loss(clean_com, com_g).item()
+                    time_error = F.l1_loss(clean_audio, audio_g).item()
+                    stft_error = F.mse_loss(com_g, com_g_hat).item()
+
                 train_iter.set_postfix(
-                    step=steps,
-                    gen=float(loss_gen_all),
-                    disc=float(loss_disc_all),
+                    format_postfix(
+                        step=steps,
+                        gen=float(loss_gen_all),
+                        disc=float(loss_disc_all),
+                        metric=metric_error,
+                        mag=mag_error,
+                        pha=pha_error,
+                        com=com_error,
+                        time=time_error,
+                        stft=stft_error,
+                        s_b=time.time() - start_b,
+                    ),
                     refresh=False,
                 )
 
-                need_metrics = (
-                    steps % a.stdout_interval == 0
-                    or steps % a.summary_interval == 0
-                )
-                if need_metrics:
-                    with torch.no_grad():
-                        metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
-                        mag_error = F.mse_loss(clean_mag, mag_g).item()
-                        ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g)
-                        pha_error = (ip_error + gd_error + iaf_error).item()
-                        com_error = F.mse_loss(clean_com, com_g).item()
-                        time_error = F.l1_loss(clean_audio, audio_g).item()
-                        stft_error = F.mse_loss(com_g, com_g_hat).item()
-
-                if steps % a.stdout_interval == 0:
-                    logger.info(
-                        'Steps: %d, Gen Loss: %.3f, Disc Loss: %.3f, '
-                        'Metric loss: %.3f, Magnitude Loss: %.3f, '
-                        'Phase Loss: %.3f, Complex Loss: %.3f, '
-                        'Time Loss: %.3f, STFT Loss: %.3f, s/b: %.3f',
-                        steps,
-                        float(loss_gen_all),
-                        float(loss_disc_all),
-                        metric_error,
-                        mag_error,
-                        pha_error,
-                        com_error,
-                        time_error,
-                        stft_error,
-                        time.time() - start_b,
-                    )
-
                 if steps % a.checkpoint_interval == 0 and steps != 0:
-                    checkpoint_path = "{}/g_{:08d}".format(a.checkpoint_path, steps)
-                    save_checkpoint(
-                        checkpoint_path,
-                        {
-                            'generator': (
-                                generator.module if h.num_gpus > 1 else generator
-                            ).state_dict()
-                        },
+                    save_latest_checkpoint(
+                        a.checkpoint_path,
+                        generator,
+                        discriminator,
+                        optim_g,
+                        optim_d,
+                        steps,
+                        epoch,
+                        h.num_gpus,
                     )
-                    checkpoint_path = "{}/do_{:08d}".format(a.checkpoint_path, steps)
-                    save_checkpoint(
-                        checkpoint_path,
-                        {
-                            'discriminator': (
-                                discriminator.module if h.num_gpus > 1 else discriminator
-                            ).state_dict(),
-                            'optim_g': optim_g.state_dict(),
-                            'optim_d': optim_d.state_dict(),
-                            'steps': steps,
-                            'epoch': epoch,
-                        },
-                    )
-                    logger.info('Saved checkpoint at step %d', steps)
+                    tqdm.write('Saved latest checkpoint at step {}'.format(steps))
+                    logger.info('Saved latest checkpoint at step %d', steps)
 
                 if steps % a.summary_interval == 0:
                     sw.add_scalar("Training/Generator Loss", loss_gen_all, steps)
@@ -579,15 +541,12 @@ def train(rank, a, h):
                             unit='utt',
                             leave=False,
                             position=2,
+                            dynamic_ncols=True,
                         )
                         for j, batch in enumerate(val_iter):
                             clean_audio, noisy_audio = batch
-                            clean_audio = torch.autograd.Variable(
-                                clean_audio.to(device, non_blocking=True)
-                            )
-                            noisy_audio = torch.autograd.Variable(
-                                noisy_audio.to(device, non_blocking=True)
-                            )
+                            clean_audio = clean_audio.to(device, non_blocking=True)
+                            noisy_audio = noisy_audio.to(device, non_blocking=True)
 
                             clean_mag, clean_pha, clean_com = mag_pha_stft(
                                 clean_audio,
@@ -596,7 +555,7 @@ def train(rank, a, h):
                                 h.win_size,
                                 h.compress_factor,
                             )
-                            noisy_mag, noisy_pha, noisy_com = mag_pha_stft(
+                            noisy_mag, noisy_pha, _ = mag_pha_stft(
                                 noisy_audio,
                                 h.n_fft,
                                 h.hop_size,
@@ -614,7 +573,7 @@ def train(rank, a, h):
                                 h.win_size,
                                 h.compress_factor,
                             )
-                            mag_g_hat, pha_g_hat, com_g_hat = mag_pha_stft(
+                            _, _, com_g_hat = mag_pha_stft(
                                 audio_g,
                                 h.n_fft,
                                 h.hop_size,
@@ -639,11 +598,33 @@ def train(rank, a, h):
                         val_com_err = val_com_err_tot / (j + 1)
                         val_stft_err = val_stft_err_tot / (j + 1)
                         val_pesq_score = pesq_score(audios_r, audios_g, h).item()
+                        tqdm.write(
+                            'Steps: {}, PESQ Score: {:.3f}'.format(
+                                steps,
+                                val_pesq_score,
+                            )
+                        )
                         logger.info(
                             'Steps: %d, PESQ Score: %.3f, s/b: %.3f',
                             steps,
                             val_pesq_score,
                             time.time() - start_b,
+                        )
+                        train_iter.set_postfix(
+                            format_postfix(
+                                step=steps,
+                                gen=float(loss_gen_all),
+                                disc=float(loss_disc_all),
+                                metric=metric_error,
+                                mag=mag_error,
+                                pha=pha_error,
+                                com=com_error,
+                                time=time_error,
+                                stft=stft_error,
+                                s_b=time.time() - start_b,
+                                pesq=val_pesq_score,
+                            ),
+                            refresh=False,
                         )
                         sw.add_scalar("Validation/PESQ Score", val_pesq_score, steps)
                         sw.add_scalar("Validation/Magnitude Loss", val_mag_err, steps)
@@ -658,16 +639,16 @@ def train(rank, a, h):
                     if epoch >= a.best_checkpoint_start_epoch:
                         if val_pesq_score > best_pesq:
                             best_pesq = val_pesq_score
-                            best_checkpoint_path = "{}/g_best".format(a.checkpoint_path)
-                            save_checkpoint(
-                                best_checkpoint_path,
-                                {
-                                    'generator': (
-                                        generator.module
-                                        if h.num_gpus > 1
-                                        else generator
-                                    ).state_dict()
-                                },
+                            save_best_checkpoint(
+                                a.checkpoint_path,
+                                generator,
+                                h.num_gpus,
+                            )
+                            tqdm.write(
+                                'Updated best checkpoint (PESQ={:.3f}) at step {}'.format(
+                                    best_pesq,
+                                    steps,
+                                )
                             )
                             logger.info(
                                 'Updated best checkpoint (PESQ=%.3f) at step %d',
@@ -681,6 +662,11 @@ def train(rank, a, h):
 
             if a.max_steps is not None and steps >= a.max_steps:
                 if rank == 0:
+                    tqdm.write(
+                        'Reached max_steps={}. Stopping training.'.format(
+                            a.max_steps,
+                        )
+                    )
                     logger.info(
                         'Reached max_steps=%d. Stopping training.',
                         a.max_steps,
@@ -691,14 +677,33 @@ def train(rank, a, h):
         scheduler_d.step()
 
         if rank == 0:
+            epoch_time = int(time.time() - start)
+            epoch_pbar.set_postfix(
+                format_postfix(epoch_time_sec=epoch_time),
+                refresh=False,
+            )
             logger.info(
                 'Time taken for epoch %d is %d sec',
                 epoch + 1,
-                int(time.time() - start),
+                epoch_time,
             )
 
         if a.max_steps is not None and steps >= a.max_steps:
             break
+
+    if rank == 0 and steps > 0:
+        save_latest_checkpoint(
+            a.checkpoint_path,
+            generator,
+            discriminator,
+            optim_g,
+            optim_d,
+            steps,
+            epoch,
+            h.num_gpus,
+        )
+        tqdm.write('Saved latest checkpoint at step {}'.format(steps))
+        logger.info('Saved latest checkpoint at step %d', steps)
 
     if h.num_gpus > 1:
         destroy_process_group()
@@ -707,7 +712,6 @@ def train(rank, a, h):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--group_name', default=None)
     parser.add_argument(
         '--input_clean_wavs_dir',
         default='data/raw/VoiceBank+DEMAND/clean_trainset_56spk_wav',
@@ -733,9 +737,8 @@ def main():
         default='data/raw/VoiceBank+DEMAND/log_testset.txt',
     )
     parser.add_argument('--checkpoint_path', default=CHECKPOINT_ROOT)
-    parser.add_argument('--config', default='src/mp_senet/model/config.json')
+    parser.add_argument('--config', default='src/mp_senet/config.json')
     parser.add_argument('--training_epochs', default=400, type=int)
-    parser.add_argument('--stdout_interval', default=5, type=int)
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
     parser.add_argument('--validation_interval', default=5000, type=int)
@@ -758,6 +761,8 @@ def main():
     os.makedirs(a.checkpoint_path, exist_ok=True)
 
     logger = setup_logging(a.checkpoint_path, rank=0)
+    tqdm.write('Initializing Training Process..')
+    tqdm.write('checkpoints directory: {}'.format(a.checkpoint_path))
     logger.info('Initializing Training Process..')
     logger.info('checkpoints directory: %s', a.checkpoint_path)
 
@@ -775,6 +780,8 @@ def main():
         torch.cuda.manual_seed(h.seed)
         h.num_gpus = torch.cuda.device_count()
         h.batch_size = int(h.batch_size / h.num_gpus)
+        tqdm.write('Batch size per GPU: {}'.format(h.batch_size))
+        tqdm.write('num_workers: {}'.format(h.num_workers))
         logger.info('Batch size per GPU: %d', h.batch_size)
         logger.info('num_workers: %d', h.num_workers)
     else:
