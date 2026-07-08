@@ -4,7 +4,7 @@
 
 | markdown | year | title |
 | :--- | :--- | :--- |
-| [stft.md](./20260704_stft.md) | 2023 | Discrete Fourier Transform |
+| [stft.md](./20260704_stft.md) | | Discrete Fourier Transform |
 
 ## Speech Enhancement
 
@@ -12,9 +12,13 @@
 | :--- | :--- | :--- |
 | [MP-SENet.md](./20260704_MP-SENet.md) | 2023 | [MP-SENet: A Speech Enhancement Model with Parallel Denoising of Magnitude and Phase Spectra](https://arxiv.org/abs/2305.13686) |
 
+---
+
 # Natural Language Processing
 
 ## Large Language Models
+
+### GPT Series
 
 | markdown | year | title |
 | :--- | :--- | :--- |
@@ -22,3 +26,9 @@
 | [GPT-2.md](./20260704_GPT-2.md) | 2019 | [Language Models are Unsupervised Multitask Learners](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) |
 | [GPT-3.md](./20260704_GPT-3.md) | 2020 | [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165) |
 | [InstructGPT.md](./20260707_InstructGPT.md) | 2022 | [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155) |
+
+### DeepSeek Series
+
+| markdown | year | title |
+| :--- | :--- | :--- |
+| [DeepSeek-V1.md](./20260708_DeepSeek-V1.md) | 2024 | [DeepSeek LLM: Scaling Open-Source Language Models with Longtermism](https://arxiv.org/abs/2401.02954) |
