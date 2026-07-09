@@ -36,8 +36,13 @@ DEFAULT_DIST_TIMEOUT_MINUTES = 120
 
 
 def configure_distributed_runtime():
-    os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+    os.environ.setdefault('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1')
     os.environ.setdefault('NCCL_P2P_DISABLE', '1')
+
+
+def dist_init_method(checkpoint_path):
+    init_file = os.path.abspath(os.path.join(checkpoint_path, '.dist_init'))
+    return 'file://' + init_file
 
 
 def resolve_dist_timeout_minutes(h, override_minutes=None):
@@ -85,9 +90,14 @@ def resolve_checkpoint_path(checkpoint_root):
         cp_do = os.path.join(checkpoint_root, 'do_latest')
         if os.path.isfile(cp_g) and os.path.isfile(cp_do):
             return checkpoint_root
+        if os.path.isfile(os.path.join(checkpoint_root, 'config.json')):
+            return checkpoint_root
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    return os.path.join(checkpoint_root, timestamp)
+    parent = checkpoint_root
+    if os.path.isfile(os.path.join(checkpoint_root, 'config.json')):
+        parent = os.path.dirname(checkpoint_root)
+    return os.path.join(parent, timestamp)
 
 
 def latest_checkpoint_paths(checkpoint_dir):
@@ -321,7 +331,7 @@ def train(rank, a, h):
     if h.num_gpus > 1:
         init_process_group(
             backend=h.dist_config['dist_backend'],
-            init_method=h.dist_config['dist_url'],
+            init_method=h.dist_init_method,
             world_size=h.dist_config['world_size'] * h.num_gpus,
             rank=rank,
             timeout=timedelta(minutes=h.dist_timeout_minutes),
@@ -356,6 +366,11 @@ def train(rank, a, h):
     if cp_g is None or cp_do is None:
         state_dict_do = None
         last_epoch = -1
+        if rank == 0:
+            logger.info(
+                'Starting training from scratch (g_latest/do_latest not found in %s)',
+                a.checkpoint_path,
+            )
     else:
         state_dict_g = load_checkpoint(cp_g, device)
         state_dict_do = load_checkpoint(cp_do, device)
@@ -363,6 +378,12 @@ def train(rank, a, h):
         discriminator.load_state_dict(state_dict_do['discriminator'])
         steps = state_dict_do['steps'] + 1
         last_epoch = state_dict_do['epoch']
+        if rank == 0:
+            logger.info(
+                'Resuming from step %d, epoch %d',
+                state_dict_do['steps'],
+                state_dict_do['epoch'] + 1,
+            )
 
     if h.num_gpus > 1:
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
@@ -540,20 +561,6 @@ def train(rank, a, h):
                     stft_error = errors['stft_error']
                     time_error = errors['time_error']
 
-                if steps % a.checkpoint_interval == 0 and steps != 0:
-                    save_latest_checkpoint(
-                        a.checkpoint_path,
-                        generator,
-                        discriminator,
-                        optim_g,
-                        optim_d,
-                        steps,
-                        epoch,
-                        h.num_gpus,
-                    )
-                    tqdm.write('Saved latest checkpoint at step {}'.format(steps))
-                    logger.info('Saved latest checkpoint at step %d', steps)
-
                 if steps % a.summary_interval == 0:
                     sw.add_scalar("Training/Generator Loss", loss_gen_all, steps)
                     sw.add_scalar("Training/Discriminator Loss", loss_disc_all, steps)
@@ -663,6 +670,22 @@ def train(rank, a, h):
                 tqdm.write(best_message)
                 logger.info(best_message)
 
+            save_latest_checkpoint(
+                a.checkpoint_path,
+                generator,
+                discriminator,
+                optim_g,
+                optim_d,
+                steps,
+                epoch,
+                h.num_gpus,
+            )
+            checkpoint_message = (
+                'Saved latest checkpoint at end of epoch {} (step {})'
+            ).format(epoch + 1, steps)
+            tqdm.write(checkpoint_message)
+            logger.info(checkpoint_message)
+
             generator.train()
 
         if h.num_gpus > 1:
@@ -678,20 +701,6 @@ def train(rank, a, h):
                 epoch + 1,
                 epoch_time,
             )
-
-    if rank == 0 and steps > 0:
-        save_latest_checkpoint(
-            a.checkpoint_path,
-            generator,
-            discriminator,
-            optim_g,
-            optim_d,
-            steps,
-            epoch,
-            h.num_gpus,
-        )
-        tqdm.write('Saved latest checkpoint at step {}'.format(steps))
-        logger.info('Saved latest checkpoint at step %d', steps)
 
     if h.num_gpus > 1:
         barrier()
@@ -728,14 +737,7 @@ def main():
     parser.add_argument('--checkpoint_path', default=CHECKPOINT_ROOT)
     parser.add_argument('--config', default='src/mp_senet/config_conformer.json')
     parser.add_argument('--training_epochs', default=400, type=int)
-    parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
-    parser.add_argument(
-        '--dist_port',
-        default=None,
-        type=int,
-        help='Override dist_config dist_url port for distributed training.',
-    )
     parser.add_argument(
         '--num_workers',
         default=None,
@@ -769,8 +771,7 @@ def main():
     h = AttrDict(json_config)
     if a.num_workers is not None:
         h.num_workers = a.num_workers
-    if a.dist_port is not None:
-        h.dist_config['dist_url'] = f'tcp://localhost:{a.dist_port}'
+    h.dist_init_method = dist_init_method(a.checkpoint_path)
     h.dist_timeout_minutes = resolve_dist_timeout_minutes(
         h,
         override_minutes=a.dist_timeout_minutes,
@@ -791,7 +792,9 @@ def main():
 
     if h.num_gpus > 1:
         configure_distributed_runtime()
+        tqdm.write('dist_init_method: {}'.format(h.dist_init_method))
         tqdm.write('dist_timeout_minutes: {}'.format(h.dist_timeout_minutes))
+        logger.info('dist_init_method: %s', h.dist_init_method)
         logger.info('dist_timeout_minutes: %d', h.dist_timeout_minutes)
         mp.spawn(train, nprocs=h.num_gpus, args=(a, h,))
     else:
