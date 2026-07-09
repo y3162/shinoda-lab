@@ -75,6 +75,7 @@ class AttentionModule(nn.Module):
             embed_dim=dim,
             num_heads=n_head,
             dropout=dropout,
+            batch_first=True,
         )
         self.layernorm = nn.LayerNorm(dim)
 

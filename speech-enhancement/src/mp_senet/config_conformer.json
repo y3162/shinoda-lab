@@ -1,6 +1,6 @@
 {
     "num_gpus": 1,
-    "batch_size": 16,
+    "batch_size": 4,
     "learning_rate": 0.0005,
     "adam_b1": 0.8,
     "adam_b2": 0.99,
@@ -10,6 +10,13 @@
     "dense_channel": 64,
     "compress_factor": 0.3,
     "beta": 2.0,
+
+    "bridge_block_type": "conformer",
+    "num_tsblocks": 4,
+    "n_heads": 4,
+    "ffm_mult": 4,
+    "ccm_expansion_factor": 2,
+    "ccm_kernel_size": 31,
 
     "sampling_rate": 16000,
     "segment_size": 32000,
@@ -21,7 +28,7 @@
 
     "dist_config": {
         "dist_backend": "nccl",
-        "dist_url": "tcp://localhost:54321",
+        "dist_url": "tcp://localhost:54322",
         "world_size": 1
     }
 }

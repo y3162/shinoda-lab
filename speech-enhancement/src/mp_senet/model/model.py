@@ -2,7 +2,47 @@ import torch
 import torch.nn as nn
 import numpy as np
 from src.mp_senet.model.transformer import TransformerBlock
+from src.mp_senet.model.conformer import ConformerBlock
 from src.mp_senet.utils import LearnableSigmoid2d
+
+
+def _resolve_bridge_block_type(h):
+    block_type = getattr(h, 'bridge_block_type', 'transformer').lower()
+    if block_type not in ('transformer', 'conformer'):
+        raise ValueError(
+            f"bridge_block_type must be 'transformer' or 'conformer', got {block_type!r}"
+        )
+    return block_type
+
+
+def _resolve_num_tsblocks(h):
+    if hasattr(h, 'num_tsblocks'):
+        return h.num_tsblocks
+    if hasattr(h, 'num_tsconformers'):
+        return h.num_tsconformers
+    return 4
+
+
+def _build_sequence_block(h):
+    block_type = _resolve_bridge_block_type(h)
+    n_heads = getattr(h, 'n_heads', 4)
+
+    if block_type == 'transformer':
+        return TransformerBlock(
+            d_model=h.dense_channel,
+            n_heads=n_heads,
+        )
+
+    return ConformerBlock(
+        dim=h.dense_channel,
+        n_head=n_heads,
+        ffm_mult=getattr(h, 'ffm_mult', 4),
+        ccm_expansion_factor=getattr(h, 'ccm_expansion_factor', 2),
+        ccm_kernel_size=getattr(h, 'ccm_kernel_size', 31),
+        ffm_dropout=getattr(h, 'ffm_dropout', 0.0),
+        attn_dropout=getattr(h, 'attn_dropout', 0.0),
+        ccm_dropout=getattr(h, 'ccm_dropout', 0.0),
+    )
 
 
 class SPConvTranspose2d(nn.Module):
@@ -188,30 +228,24 @@ class TSTransformerBlock(nn.Module):
         super().__init__()
 
         self.h = h
-        self.time_transformer = TransformerBlock(
-            d_model=h.dense_channel,
-            n_heads=4,
-        )
-        self.freq_transformer = TransformerBlock(
-            d_model=h.dense_channel,
-            n_heads=4,
-        )
+        self.time_block = _build_sequence_block(h)
+        self.freq_block = _build_sequence_block(h)
 
     def forward(self, x):
         batch_size, channels, time_steps, freq_bins = x.size()
 
-        # Time transformer
+        # Time block
         # [B, C, T, F] -> [B * F, T, C]
         x = x.permute(0, 3, 2, 1).contiguous()
         x = x.view(batch_size * freq_bins, time_steps, channels)
-        x = self.time_transformer(x) + x
+        x = self.time_block(x) + x
 
-        # Frequency transformer
+        # Frequency block
         # [B * F, T, C] -> [B * T, F, C]
         x = x.view(batch_size, freq_bins, time_steps, channels)
         x = x.permute(0, 2, 1, 3).contiguous()
         x = x.view(batch_size * time_steps, freq_bins, channels)
-        x = self.freq_transformer(x) + x
+        x = self.freq_block(x) + x
 
         # [B * T, F, C] -> [B, C, T, F]
         x = x.view(batch_size, time_steps, freq_bins, channels)
@@ -221,10 +255,13 @@ class TSTransformerBlock(nn.Module):
 
 
 class MPNet(nn.Module):
-    def __init__(self, h, num_tsblocks=4):
+    def __init__(self, h, num_tsblocks=None):
         super().__init__()
 
         self.h = h
+
+        if num_tsblocks is None:
+            num_tsblocks = _resolve_num_tsblocks(h)
 
         self.num_tscblocks = num_tsblocks
 

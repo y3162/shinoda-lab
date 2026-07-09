@@ -714,10 +714,16 @@ def main():
         default='data/raw/VoiceBank+DEMAND/log_testset.txt',
     )
     parser.add_argument('--checkpoint_path', default=CHECKPOINT_ROOT)
-    parser.add_argument('--config', default='src/mp_senet/config.json')
+    parser.add_argument('--config', default='src/mp_senet/config_conformer.json')
     parser.add_argument('--training_epochs', default=400, type=int)
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
+    parser.add_argument(
+        '--dist_port',
+        default=None,
+        type=int,
+        help='Override dist_config dist_url port for distributed training.',
+    )
     parser.add_argument(
         '--num_workers',
         default=None,
@@ -742,6 +748,8 @@ def main():
     h = AttrDict(json_config)
     if a.num_workers is not None:
         h.num_workers = a.num_workers
+    if a.dist_port is not None:
+        h.dist_config['dist_url'] = f'tcp://localhost:{a.dist_port}'
     build_env(a.config, 'config.json', a.checkpoint_path)
 
     torch.manual_seed(h.seed)
