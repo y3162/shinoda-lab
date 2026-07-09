@@ -82,12 +82,12 @@ class NoisyInferenceDataset(Dataset):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--noise_config_id',  type=int,                           required=True)
-    parser.add_argument('--model_name',       type=str,                           required=True)
-    parser.add_argument('--batch_size',       type=int, default=None,             required=False)
-    parser.add_argument('--num_workers',      type=int, default=16,             required=False)
-    parser.add_argument('--prefetch_factor',  type=int, default=4,             required=False)
-    parser.add_argument('--max_batch_frames', type=int, default=None,             required=False)
+    parser.add_argument('--noise_config_id',  type=int,               required=True)
+    parser.add_argument('--model_name',       type=str,               required=True)
+    parser.add_argument('--batch_size',       type=int, default=None, required=False)
+    parser.add_argument('--num_workers',      type=int, default=16,   required=False)
+    parser.add_argument('--prefetch_factor',  type=int, default=4,    required=False)
+    parser.add_argument('--max_batch_frames', type=int, default=None, required=False)
     args = parser.parse_args()
 
     NOISE_CONFIG_ID = args.noise_config_id
