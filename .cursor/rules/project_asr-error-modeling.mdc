@@ -21,6 +21,8 @@ When executing commands in the terminal, always activate the environment first:
 source ./.venv/nemo_asr_env/bin/activate
 # if using Whisper Large V3
 source ./.venv/whisper_env/bin/activate
+# if using Seq2Seq Transformer
+source ./.venv/seq2seq_transformer_env/bin/activate
 ```
 
 ## Environment Variables

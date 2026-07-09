@@ -68,6 +68,38 @@ uv pip install \
 uv pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
 uv pip install protobuf
 ```
+
+### Seq2Seq Transformer
+
+#### Environment Activation
+
+```bash
+uv venv ./.venv/seq2seq_transformer_env --python 3.10
+source ./.venv/seq2seq_transformer_env/bin/activate
+```
+
+#### Install Dependencies
+
+```bash
+uv pip install \
+    torch==2.6.0 \
+    numpy \
+    pandas \
+    pyarrow \
+    duckdb \
+    duckdb-cli \
+    tqdm \
+    jiwer \
+    sentencepiece \
+    tensorboard \
+    matplotlib \
+    scikit-learn \
+    pyyaml \
+    packaging \
+    --index-url https://download.pytorch.org/whl/cu124 \
+    --extra-index-url https://pypi.org/simple
+```
+
 ---
 
 ## Dataset Preparation
