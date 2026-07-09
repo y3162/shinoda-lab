@@ -8,7 +8,7 @@ import json
 import logging
 import random
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import librosa
 import torch
@@ -32,6 +32,18 @@ from src.mp_senet.utils import (
 torch.backends.cudnn.benchmark = True
 
 CHECKPOINT_ROOT = 'data/checkpoints/mp_senet'
+DEFAULT_DIST_TIMEOUT_MINUTES = 120
+
+
+def configure_distributed_runtime():
+    os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+    os.environ.setdefault('NCCL_P2P_DISABLE', '1')
+
+
+def resolve_dist_timeout_minutes(h, override_minutes=None):
+    if override_minutes is not None:
+        return override_minutes
+    return h.dist_config.get('dist_timeout_minutes', DEFAULT_DIST_TIMEOUT_MINUTES)
 
 
 def setup_logging(log_dir, rank=0):
@@ -312,11 +324,14 @@ def train(rank, a, h):
             init_method=h.dist_config['dist_url'],
             world_size=h.dist_config['world_size'] * h.num_gpus,
             rank=rank,
+            timeout=timedelta(minutes=h.dist_timeout_minutes),
         )
 
     logger = setup_logging(a.checkpoint_path, rank=rank)
 
     torch.cuda.manual_seed(h.seed)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
     device = torch.device('cuda:{:d}'.format(rank))
 
     generator = MPNet(h).to(device)
@@ -502,6 +517,9 @@ def train(rank, a, h):
             loss_gen_all.backward()
             optim_g.step()
 
+            if h.num_gpus > 1:
+                barrier()
+
             if rank == 0:
                 with torch.no_grad():
                     metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
@@ -545,6 +563,9 @@ def train(rank, a, h):
                     sw.add_scalar("Training/Complex Loss", com_error, steps)
                     sw.add_scalar("Training/Time Loss", time_error, steps)
                     sw.add_scalar("Training/Consistency Loss", stft_error, steps)
+
+            if h.num_gpus > 1:
+                barrier()
 
             steps += 1
 
@@ -673,6 +694,7 @@ def train(rank, a, h):
         logger.info('Saved latest checkpoint at step %d', steps)
 
     if h.num_gpus > 1:
+        barrier()
         destroy_process_group()
 
 
@@ -720,6 +742,15 @@ def main():
         type=int,
         help='Override config num_workers for DataLoader.',
     )
+    parser.add_argument(
+        '--dist_timeout_minutes',
+        default=None,
+        type=int,
+        help=(
+            'NCCL/process-group timeout in minutes for barrier and collective ops. '
+            'Increase when running multiple jobs on one host.'
+        ),
+    )
 
     a = parser.parse_args()
     a.checkpoint_path = resolve_checkpoint_path(a.checkpoint_path)
@@ -740,6 +771,10 @@ def main():
         h.num_workers = a.num_workers
     if a.dist_port is not None:
         h.dist_config['dist_url'] = f'tcp://localhost:{a.dist_port}'
+    h.dist_timeout_minutes = resolve_dist_timeout_minutes(
+        h,
+        override_minutes=a.dist_timeout_minutes,
+    )
     build_env(a.config, 'config.json', a.checkpoint_path)
 
     torch.manual_seed(h.seed)
@@ -755,6 +790,9 @@ def main():
         raise RuntimeError('CUDA is required for training.')
 
     if h.num_gpus > 1:
+        configure_distributed_runtime()
+        tqdm.write('dist_timeout_minutes: {}'.format(h.dist_timeout_minutes))
+        logger.info('dist_timeout_minutes: %d', h.dist_timeout_minutes)
         mp.spawn(train, nprocs=h.num_gpus, args=(a, h,))
     else:
         train(0, a, h)
