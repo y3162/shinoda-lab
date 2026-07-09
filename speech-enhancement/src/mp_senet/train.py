@@ -26,7 +26,6 @@ from src.mp_senet.utils import (
     AttrDict,
     load_checkpoint,
     save_checkpoint,
-    batch_pesq,
     pesq_score,
 )
 
@@ -468,22 +467,13 @@ def train(rank, a, h):
             mag_g_hat = outputs['mag_g_hat']
             com_g_hat = outputs['com_g_hat']
 
-            audio_list_r, audio_list_g = (
-                list(clean_audio.cpu().numpy()),
-                list(audio_g.detach().cpu().numpy()),
-            )
-            batch_pesq_score = batch_pesq(audio_list_r, audio_list_g)
-
             optim_d.zero_grad()
             metric_r = discriminator(clean_mag, clean_mag)
             metric_g = discriminator(clean_mag, mag_g_hat.detach())
             loss_disc_r = F.mse_loss(one_labels, metric_r.flatten())
-
-            if batch_pesq_score is not None:
-                loss_disc_g = F.mse_loss(batch_pesq_score.to(device), metric_g.flatten())
-            else:
-                logger.warning('pesq is None!')
-                loss_disc_g = 0
+            # Step-wise PESQ calculation is intentionally disabled to avoid
+            # CPU-side blocking and GPU idle time.
+            loss_disc_g = 0
 
             loss_disc_all = loss_disc_r + loss_disc_g
             loss_disc_all.backward()
