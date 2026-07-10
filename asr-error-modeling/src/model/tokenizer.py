@@ -310,6 +310,8 @@ class SentencePieceTokenizer(BaseTokenizer):
         normalization_rule_name: str = 'identity',
         character_coverage: float = 1.0,
         input_corpus: str | None = None,
+        input_sentence_size: int | None = None,
+        shuffle_input_sentence: bool = False,
     ) -> None:
         try:
             import sentencepiece as spm
@@ -329,6 +331,8 @@ class SentencePieceTokenizer(BaseTokenizer):
         self.normalization_rule_name = normalization_rule_name
         self.character_coverage = character_coverage
         self.input_corpus = input_corpus
+        self.input_sentence_size = input_sentence_size
+        self.shuffle_input_sentence = shuffle_input_sentence
         self._validate_special_token_ids()
 
     @property
@@ -383,6 +387,8 @@ class SentencePieceTokenizer(BaseTokenizer):
         skip_unk_on_decode: bool = False,
         normalization_rule_name: str = 'identity',
         character_coverage: float = 1.0,
+        input_sentence_size: int | None = None,
+        shuffle_input_sentence: bool = True,
     ) -> SentencePieceTokenizer:
         try:
             import sentencepiece as spm
@@ -403,22 +409,28 @@ class SentencePieceTokenizer(BaseTokenizer):
         output_dir.mkdir(parents=True, exist_ok=True)
 
         model_prefix = str(output_dir / 'tokenizer')
-        spm.SentencePieceTrainer.train(
-            input=str(input_path),
-            model_prefix=model_prefix,
-            model_type=model_type,
-            vocab_size=vocab_size,
-            pad_id=PAD_ID,
-            bos_id=BOS_ID,
-            eos_id=EOS_ID,
-            unk_id=UNK_ID,
-            pad_piece=PAD_TOKEN,
-            bos_piece=BOS_TOKEN,
-            eos_piece=EOS_TOKEN,
-            unk_piece=UNK_TOKEN,
-            character_coverage=character_coverage,
-            normalization_rule_name=normalization_rule_name,
-        )
+        train_kwargs: dict[str, Any] = {
+            'input': str(input_path),
+            'model_prefix': model_prefix,
+            'model_type': model_type,
+            'vocab_size': vocab_size,
+            'pad_id': PAD_ID,
+            'bos_id': BOS_ID,
+            'eos_id': EOS_ID,
+            'unk_id': UNK_ID,
+            'pad_piece': PAD_TOKEN,
+            'bos_piece': BOS_TOKEN,
+            'eos_piece': EOS_TOKEN,
+            'unk_piece': UNK_TOKEN,
+            'character_coverage': character_coverage,
+            'normalization_rule_name': normalization_rule_name,
+            'train_extremely_large_corpus': True,
+        }
+        if input_sentence_size is not None and input_sentence_size > 0:
+            train_kwargs['input_sentence_size'] = input_sentence_size
+            train_kwargs['shuffle_input_sentence'] = shuffle_input_sentence
+
+        spm.SentencePieceTrainer.train(**train_kwargs)
 
         tokenizer = cls(
             Path(f'{model_prefix}.model'),
@@ -427,6 +439,10 @@ class SentencePieceTokenizer(BaseTokenizer):
             normalization_rule_name=normalization_rule_name,
             character_coverage=character_coverage,
             input_corpus=str(input_path),
+            input_sentence_size=input_sentence_size,
+            shuffle_input_sentence=(
+                shuffle_input_sentence if input_sentence_size and input_sentence_size > 0 else False
+            ),
         )
         tokenizer.save(output_dir)
         return tokenizer
@@ -444,6 +460,8 @@ class SentencePieceTokenizer(BaseTokenizer):
             normalization_rule_name=config.get('normalization_rule_name', 'identity'),
             character_coverage=config.get('character_coverage', 1.0),
             input_corpus=config.get('input_corpus'),
+            input_sentence_size=config.get('input_sentence_size'),
+            shuffle_input_sentence=config.get('shuffle_input_sentence', False),
         )
 
     def _build_config(self) -> dict[str, Any]:
@@ -463,6 +481,8 @@ class SentencePieceTokenizer(BaseTokenizer):
             'normalization_rule_name': self.normalization_rule_name,
             'character_coverage': self.character_coverage,
             'input_corpus': self.input_corpus,
+            'input_sentence_size': self.input_sentence_size,
+            'shuffle_input_sentence': self.shuffle_input_sentence,
             'model_file': SP_MODEL_FILE,
             'vocab_file': SP_VOCAB_FILE,
         }
@@ -536,6 +556,8 @@ class TokenizerFactory:
                 skip_unk_on_decode=kwargs.get('skip_unk_on_decode', False),
                 normalization_rule_name=kwargs.get('normalization_rule_name', 'identity'),
                 character_coverage=kwargs.get('character_coverage', 1.0),
+                input_sentence_size=kwargs.get('input_sentence_size'),
+                shuffle_input_sentence=kwargs.get('shuffle_input_sentence', True),
             )
 
         raise ValueError(f'Unsupported tokenizer_type: {tokenizer_type}')

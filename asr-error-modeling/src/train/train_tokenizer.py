@@ -70,6 +70,9 @@ def export_corpus(
     return written
 
 
+DEFAULT_INPUT_SENTENCE_SIZE = 5_000_000
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Train a tokenizer from asr_results transcripts (LibriSpeech train*).',
@@ -106,6 +109,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
     )
+    parser.add_argument(
+        '--input_sentence_size',
+        type=int,
+        default=None,
+        help=(
+            'Number of sentences to sample for SentencePiece training. '
+            f'Default: {DEFAULT_INPUT_SENTENCE_SIZE}. Set 0 to use the full corpus.'
+        ),
+    )
+    parser.add_argument(
+        '--shuffle_input_sentence',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Shuffle the corpus before sampling (used with --input_sentence_size).',
+    )
     return parser.parse_args()
 
 
@@ -116,6 +134,12 @@ def main() -> None:
         if args.vocab_size is None:
             print_error('--vocab_size is required for SentencePiece tokenizers.')
             return
+        if args.input_sentence_size is None:
+            args.input_sentence_size = DEFAULT_INPUT_SENTENCE_SIZE
+            print_log(
+                f'Using default input_sentence_size={DEFAULT_INPUT_SENTENCE_SIZE} '
+                'for SentencePiece training. Set --input_sentence_size 0 to use the full corpus.'
+            )
 
     if not SQL_ROOT.exists():
         print_error(f'SQL database does not exist at {SQL_ROOT}')
@@ -172,6 +196,9 @@ def main() -> None:
         train_kwargs['vocab_size'] = args.vocab_size
         train_kwargs['normalization_rule_name'] = args.normalization_rule_name
         train_kwargs['character_coverage'] = args.character_coverage
+        if args.input_sentence_size > 0:
+            train_kwargs['input_sentence_size'] = args.input_sentence_size
+            train_kwargs['shuffle_input_sentence'] = args.shuffle_input_sentence
 
     print_log(
         f'Training {args.tokenizer_type} tokenizer into {output_dir}'
