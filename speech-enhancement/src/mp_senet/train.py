@@ -17,6 +17,7 @@ import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DistributedSampler, DataLoader
 from torch.distributed import init_process_group, destroy_process_group, barrier
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
@@ -26,7 +27,7 @@ from src.mp_senet.utils import (
     AttrDict,
     load_checkpoint,
     save_checkpoint,
-    pesq_score,
+    cal_pesq,
 )
 
 torch.backends.cudnn.benchmark = True
@@ -35,13 +36,20 @@ CHECKPOINT_ROOT = 'data/checkpoints/mp_senet'
 DEFAULT_DIST_TIMEOUT_MINUTES = 120
 
 
+def device_barrier(device, world_size):
+    if world_size > 1:
+        barrier(device_ids=[device.index])
+
+
 def configure_distributed_runtime():
     os.environ.setdefault('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1')
-    os.environ.setdefault('NCCL_P2P_DISABLE', '1')
+    os.environ.setdefault('NCCL_IB_DISABLE', '1')
 
 
 def dist_init_method(checkpoint_path):
     init_file = os.path.abspath(os.path.join(checkpoint_path, '.dist_init'))
+    if os.path.isfile(init_file):
+        os.remove(init_file)
     return 'file://' + init_file
 
 
@@ -241,6 +249,114 @@ def compute_reconstruction_errors(
     return errors
 
 
+def aggregate_sum(value, device, world_size):
+    tensor = torch.tensor([value], device=device, dtype=torch.float64)
+    if world_size > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor.item()
+
+
+def run_validation(
+    generator,
+    validation_loader,
+    device,
+    h,
+    *,
+    rank,
+    world_size,
+    epoch,
+    total_epochs,
+):
+    generator.eval()
+    torch.cuda.empty_cache()
+
+    audios_r, audios_g = [], []
+    val_mag_err_tot = 0.0
+    val_pha_err_tot = 0.0
+    val_com_err_tot = 0.0
+    val_stft_err_tot = 0.0
+    num_batches = 0
+
+    val_pbar = None
+    if rank == 0:
+        val_pbar = tqdm(
+            total=len(validation_loader),
+            unit='sample',
+            desc='Validation {}/{}'.format(epoch + 1, total_epochs),
+            dynamic_ncols=True,
+            leave=False,
+        )
+
+    with torch.no_grad():
+        for batch in validation_loader:
+            clean_audio, noisy_audio = batch
+            clean_audio = clean_audio.to(device, non_blocking=True)
+            noisy_audio = noisy_audio.to(device, non_blocking=True)
+
+            outputs = forward_generator_batch(generator, clean_audio, noisy_audio, h)
+            errors = compute_reconstruction_errors(
+                outputs['clean_mag'],
+                outputs['clean_pha'],
+                outputs['clean_com'],
+                outputs['mag_g'],
+                outputs['pha_g'],
+                outputs['com_g'],
+                outputs['com_g_hat'],
+            )
+            audios_r += torch.split(clean_audio, 1, dim=0)
+            audios_g += torch.split(outputs['audio_g'], 1, dim=0)
+
+            val_mag_err_tot += errors['mag_error']
+            val_pha_err_tot += errors['pha_error']
+            val_com_err_tot += errors['com_error']
+            val_stft_err_tot += errors['stft_error']
+            num_batches += 1
+
+            if val_pbar is not None:
+                val_pbar.set_postfix(
+                    format_postfix(
+                        mag=errors['mag_error'],
+                        pha=errors['pha_error'],
+                        com=errors['com_error'],
+                        stft=errors['stft_error'],
+                    ),
+                    refresh=False,
+                )
+                val_pbar.update(1)
+
+    if val_pbar is not None:
+        val_pbar.close()
+
+    total_batches = aggregate_sum(num_batches, device, world_size)
+    val_mag_err = aggregate_sum(val_mag_err_tot, device, world_size) / total_batches
+    val_pha_err = aggregate_sum(val_pha_err_tot, device, world_size) / total_batches
+    val_com_err = aggregate_sum(val_com_err_tot, device, world_size) / total_batches
+    val_stft_err = aggregate_sum(val_stft_err_tot, device, world_size) / total_batches
+
+    pesq_sum = 0.0
+    pesq_count = 0
+    if audios_r:
+        for ref, est in zip(audios_r, audios_g):
+            pesq_sum += cal_pesq(
+                ref.squeeze().cpu().numpy(),
+                est.squeeze().cpu().numpy(),
+                h.sampling_rate,
+            )
+            pesq_count += 1
+
+    total_pesq_sum = aggregate_sum(pesq_sum, device, world_size)
+    total_pesq_count = aggregate_sum(pesq_count, device, world_size)
+    val_pesq_score = total_pesq_sum / total_pesq_count if total_pesq_count > 0 else 0.0
+
+    return {
+        'pesq': val_pesq_score,
+        'mag': val_mag_err,
+        'pha': val_pha_err,
+        'com': val_com_err,
+        'stft': val_stft_err,
+    }
+
+
 def get_dataset_filelist(a):
     with open(a.input_training_file, 'r', encoding='utf-8') as fi:
         training_indexes = [
@@ -328,6 +444,10 @@ class Dataset(torch.utils.data.Dataset):
 
 
 def train(rank, a, h):
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+    device = torch.device('cuda:{:d}'.format(rank))
+
     if h.num_gpus > 1:
         init_process_group(
             backend=h.dist_config['dist_backend'],
@@ -335,14 +455,12 @@ def train(rank, a, h):
             world_size=h.dist_config['world_size'] * h.num_gpus,
             rank=rank,
             timeout=timedelta(minutes=h.dist_timeout_minutes),
+            device_id=device,
         )
 
     logger = setup_logging(a.checkpoint_path, rank=rank)
 
     torch.cuda.manual_seed(h.seed)
-    if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
-    device = torch.device('cuda:{:d}'.format(rank))
 
     generator = MPNet(h).to(device)
     discriminator = MetricDiscriminator().to(device)
@@ -386,6 +504,9 @@ def train(rank, a, h):
             )
 
     if h.num_gpus > 1:
+        device_barrier(device, h.num_gpus)
+
+    if h.num_gpus > 1:
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         discriminator = DistributedDataParallel(discriminator, device_ids=[rank]).to(device)
 
@@ -416,6 +537,7 @@ def train(rank, a, h):
     )
 
     training_indexes, validation_indexes = get_dataset_filelist(a)
+    world_size = h.num_gpus
 
     trainset = Dataset(
         training_indexes,
@@ -427,7 +549,7 @@ def train(rank, a, h):
         shuffle=False if h.num_gpus > 1 else True,
     )
 
-    train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
+    train_sampler = DistributedSampler(trainset) if world_size > 1 else None
 
     train_loader = DataLoader(
         trainset,
@@ -439,27 +561,32 @@ def train(rank, a, h):
         drop_last=True,
     )
 
+    validset = Dataset(
+        validation_indexes,
+        a.input_validation_clean_wavs_dir,
+        a.input_validation_noisy_wavs_dir,
+        h.segment_size,
+        h.sampling_rate,
+        split=False,
+        shuffle=False,
+    )
+
+    valid_sampler = (
+        DistributedSampler(validset, shuffle=False, drop_last=False)
+        if world_size > 1 else None
+    )
+
+    validation_loader = DataLoader(
+        validset,
+        num_workers=max(1, h.num_workers // 2),
+        shuffle=False,
+        sampler=valid_sampler,
+        batch_size=1,
+        pin_memory=True,
+        drop_last=False,
+    )
+
     if rank == 0:
-        validset = Dataset(
-            validation_indexes,
-            a.input_validation_clean_wavs_dir,
-            a.input_validation_noisy_wavs_dir,
-            h.segment_size,
-            h.sampling_rate,
-            split=False,
-            shuffle=False,
-        )
-
-        validation_loader = DataLoader(
-            validset,
-            num_workers=1,
-            shuffle=False,
-            sampler=None,
-            batch_size=1,
-            pin_memory=True,
-            drop_last=True,
-        )
-
         sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
 
     generator.train()
@@ -467,8 +594,9 @@ def train(rank, a, h):
 
     best_pesq = 0
     epoch = last_epoch
+    start_epoch = 0 if last_epoch < 0 else last_epoch + 1
 
-    for epoch in range(max(0, last_epoch), a.training_epochs):
+    for epoch in range(start_epoch, a.training_epochs):
         if rank == 0:
             start = time.time()
             logger.info('Epoch: %d', epoch + 1)
@@ -488,6 +616,7 @@ def train(rank, a, h):
 
         for batch in train_loader:
             clean_audio, noisy_audio = batch
+
             clean_audio = clean_audio.to(device, non_blocking=True)
             noisy_audio = noisy_audio.to(device, non_blocking=True)
             one_labels = torch.ones(h.batch_size).to(device, non_blocking=True)
@@ -538,9 +667,6 @@ def train(rank, a, h):
             loss_gen_all.backward()
             optim_g.step()
 
-            if h.num_gpus > 1:
-                barrier()
-
             if rank == 0:
                 with torch.no_grad():
                     metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
@@ -571,15 +697,9 @@ def train(rank, a, h):
                     sw.add_scalar("Training/Time Loss", time_error, steps)
                     sw.add_scalar("Training/Consistency Loss", stft_error, steps)
 
-            if h.num_gpus > 1:
-                barrier()
-
-            steps += 1
-
-            if rank == 0:
                 train_pbar.set_postfix(
                     format_postfix(
-                        step=steps,
+                        step=steps + 1,
                         gen=float(loss_gen_all),
                         disc=float(loss_disc_all),
                         metric=metric_error,
@@ -593,72 +713,46 @@ def train(rank, a, h):
                 )
                 train_pbar.update(h.batch_size)
 
+            steps += 1
+
         if rank == 0:
             train_pbar.close()
 
+        val_metrics = run_validation(
+            generator,
+            validation_loader,
+            device,
+            h,
+            rank=rank,
+            world_size=world_size,
+            epoch=epoch,
+            total_epochs=a.training_epochs,
+        )
+
         if rank == 0:
-            generator.eval()
-            torch.cuda.empty_cache()
-            audios_r, audios_g = [], []
-            val_mag_err_tot = 0
-            val_pha_err_tot = 0
-            val_com_err_tot = 0
-            val_stft_err_tot = 0
-            with torch.no_grad():
-                for j, batch in enumerate(validation_loader):
-                    clean_audio, noisy_audio = batch
-                    clean_audio = clean_audio.to(device, non_blocking=True)
-                    noisy_audio = noisy_audio.to(device, non_blocking=True)
-
-                    outputs = forward_generator_batch(
-                        generator, clean_audio, noisy_audio, h,
-                    )
-                    errors = compute_reconstruction_errors(
-                        outputs['clean_mag'],
-                        outputs['clean_pha'],
-                        outputs['clean_com'],
-                        outputs['mag_g'],
-                        outputs['pha_g'],
-                        outputs['com_g'],
-                        outputs['com_g_hat'],
-                    )
-                    audios_r += torch.split(clean_audio, 1, dim=0)
-                    audios_g += torch.split(outputs['audio_g'], 1, dim=0)
-
-                    val_mag_err_tot += errors['mag_error']
-                    val_pha_err_tot += errors['pha_error']
-                    val_com_err_tot += errors['com_error']
-                    val_stft_err_tot += errors['stft_error']
-
-            val_mag_err = val_mag_err_tot / (j + 1)
-            val_pha_err = val_pha_err_tot / (j + 1)
-            val_com_err = val_com_err_tot / (j + 1)
-            val_stft_err = val_stft_err_tot / (j + 1)
-            val_pesq_score = pesq_score(audios_r, audios_g, h).item()
-
             val_message = (
                 'Validation (epoch {}/{}): PESQ={:.3f}, mag={:.3f}, '
                 'pha={:.3f}, com={:.3f}, stft={:.3f}'
             ).format(
                 epoch + 1,
                 a.training_epochs,
-                val_pesq_score,
-                val_mag_err,
-                val_pha_err,
-                val_com_err,
-                val_stft_err,
+                val_metrics['pesq'],
+                val_metrics['mag'],
+                val_metrics['pha'],
+                val_metrics['com'],
+                val_metrics['stft'],
             )
             tqdm.write(val_message)
             logger.info(val_message)
 
-            sw.add_scalar("Validation/PESQ Score", val_pesq_score, epoch + 1)
-            sw.add_scalar("Validation/Magnitude Loss", val_mag_err, epoch + 1)
-            sw.add_scalar("Validation/Phase Loss", val_pha_err, epoch + 1)
-            sw.add_scalar("Validation/Complex Loss", val_com_err, epoch + 1)
-            sw.add_scalar("Validation/Consistency Loss", val_stft_err, epoch + 1)
+            sw.add_scalar('Validation/PESQ Score', val_metrics['pesq'], epoch + 1)
+            sw.add_scalar('Validation/Magnitude Loss', val_metrics['mag'], epoch + 1)
+            sw.add_scalar('Validation/Phase Loss', val_metrics['pha'], epoch + 1)
+            sw.add_scalar('Validation/Complex Loss', val_metrics['com'], epoch + 1)
+            sw.add_scalar('Validation/Consistency Loss', val_metrics['stft'], epoch + 1)
 
-            if val_pesq_score > best_pesq:
-                best_pesq = val_pesq_score
+            if val_metrics['pesq'] > best_pesq:
+                best_pesq = val_metrics['pesq']
                 save_best_checkpoint(
                     a.checkpoint_path,
                     generator,
@@ -686,10 +780,10 @@ def train(rank, a, h):
             tqdm.write(checkpoint_message)
             logger.info(checkpoint_message)
 
-            generator.train()
+        generator.train()
 
         if h.num_gpus > 1:
-            barrier()
+            device_barrier(device, h.num_gpus)
 
         scheduler_g.step()
         scheduler_d.step()
@@ -703,7 +797,6 @@ def train(rank, a, h):
             )
 
     if h.num_gpus > 1:
-        barrier()
         destroy_process_group()
 
 
