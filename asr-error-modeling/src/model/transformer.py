@@ -93,6 +93,15 @@ class Seq2SeqTransformer(nn.Module):
         tgt_ids: torch.Tensor,
         global_prefix_len: int = 0,
     ) -> torch.Tensor:
+        if src_ids.size(1) > self.context_length:
+            raise ValueError(
+                f'src length {src_ids.size(1)} exceeds context_length {self.context_length}'
+            )
+        if tgt_ids.size(1) > self.context_length:
+            raise ValueError(
+                f'tgt length {tgt_ids.size(1)} exceeds context_length {self.context_length}'
+            )
+
         decoder_input = tgt_ids[:, :-1]
 
         src_emb = self.token_embedding(src_ids)
@@ -109,6 +118,7 @@ class Seq2SeqTransformer(nn.Module):
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(
             decoder_input.size(1),
             device=decoder_input.device,
+            dtype=torch.bool,
         )
 
         src_key_padding_mask = src_ids.eq(self.pad_id)

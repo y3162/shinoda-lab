@@ -24,6 +24,7 @@ from src.train.dataset import (
     AsrPairTokenizingDataset,
     ConditionVocab,
     Direction,
+    RowGroupShuffleSampler,
     collate_samples,
 )
 
@@ -395,12 +396,14 @@ def build_dataloaders(
         tokenizer,
         condition_vocab,
         direction=direction,
+        context_length=config.model.context_length,
     )
     valid_tokenizing_dataset = AsrPairTokenizingDataset(
         valid_dataset,
         tokenizer,
         condition_vocab,
         direction=direction,
+        context_length=config.model.context_length,
     )
     dataloader_kwargs = {
         'batch_size': train.batch_size,
@@ -411,7 +414,10 @@ def build_dataloaders(
     }
     train_dataloader = DataLoader(
         train_tokenizing_dataset,
-        shuffle=True,
+        sampler=RowGroupShuffleSampler(
+            train_dataset.row_group_offsets,
+            generator=generator,
+        ),
         drop_last=True,
         **dataloader_kwargs,
     )
@@ -549,6 +555,8 @@ def run_training(default_config_path: Path = DEFAULT_CONFIG_PATH) -> None:
     logger.info('device: %s', device)
     logger.info('train samples: %d', len(train_dataset))
     logger.info('valid samples: %d', len(valid_dataset))
+    logger.info('train pair cache: %s', train_dataset.parquet_path)
+    logger.info('valid pair cache: %s', valid_dataset.parquet_path)
     logger.info('noise_config_ids: %s', noise_config_ids)
     logger.info(
         'Total Parameters: %.3fM',
