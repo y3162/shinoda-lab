@@ -1,6 +1,7 @@
 __pycache__/
 
 TODO.md
+.cursor/handoffs/
 
 .venv/
 data/
