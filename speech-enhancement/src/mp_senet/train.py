@@ -6,11 +6,9 @@ import time
 import argparse
 import json
 import logging
-import random
 import shutil
 from datetime import datetime, timedelta
 
-import librosa
 import torch
 import torch.nn.functional as F
 import torch.multiprocessing as mp
@@ -21,6 +19,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
+from src.mp_senet.dataset import build_datasets
 from src.mp_senet.model.model import MPNet, phase_losses
 from src.mp_senet.model.discriminator import MetricDiscriminator
 from src.mp_senet.utils import (
@@ -357,92 +356,6 @@ def run_validation(
     }
 
 
-def get_dataset_filelist(a):
-    with open(a.input_training_file, 'r', encoding='utf-8') as fi:
-        training_indexes = [
-            x.split('|')[0].split()[0]
-            for x in fi.read().split('\n')
-            if len(x) > 0
-        ]
-
-    with open(a.input_validation_file, 'r', encoding='utf-8') as fi:
-        validation_indexes = [
-            x.split('|')[0].split()[0]
-            for x in fi.read().split('\n')
-            if len(x) > 0
-        ]
-
-    return training_indexes, validation_indexes
-
-
-class Dataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        training_indexes,
-        clean_wavs_dir,
-        noisy_wavs_dir,
-        segment_size,
-        sampling_rate,
-        split=True,
-        shuffle=True,
-    ):
-        self.audio_indexes = training_indexes
-        random.seed(1234)
-        if shuffle:
-            random.shuffle(self.audio_indexes)
-        self.clean_wavs_dir = clean_wavs_dir
-        self.noisy_wavs_dir = noisy_wavs_dir
-        self.segment_size = segment_size
-        self.sampling_rate = sampling_rate
-        self.split = split
-
-    def __getitem__(self, index):
-        filename = self.audio_indexes[index]
-        clean_audio, _ = librosa.load(
-            os.path.join(self.clean_wavs_dir, filename + '.wav'),
-            sr=self.sampling_rate,
-        )
-        noisy_audio, _ = librosa.load(
-            os.path.join(self.noisy_wavs_dir, filename + '.wav'),
-            sr=self.sampling_rate,
-        )
-        length = min(len(clean_audio), len(noisy_audio))
-        clean_audio, noisy_audio = clean_audio[:length], noisy_audio[:length]
-
-        clean_audio, noisy_audio = (
-            torch.FloatTensor(clean_audio),
-            torch.FloatTensor(noisy_audio),
-        )
-        norm_factor = torch.sqrt(len(noisy_audio) / torch.sum(noisy_audio ** 2.0))
-        clean_audio = (clean_audio * norm_factor).unsqueeze(0)
-        noisy_audio = (noisy_audio * norm_factor).unsqueeze(0)
-
-        assert clean_audio.size(1) == noisy_audio.size(1)
-
-        if self.split:
-            if clean_audio.size(1) >= self.segment_size:
-                max_audio_start = clean_audio.size(1) - self.segment_size
-                audio_start = random.randint(0, max_audio_start)
-                clean_audio = clean_audio[:, audio_start: audio_start + self.segment_size]
-                noisy_audio = noisy_audio[:, audio_start: audio_start + self.segment_size]
-            else:
-                clean_audio = torch.nn.functional.pad(
-                    clean_audio,
-                    (0, self.segment_size - clean_audio.size(1)),
-                    'constant',
-                )
-                noisy_audio = torch.nn.functional.pad(
-                    noisy_audio,
-                    (0, self.segment_size - noisy_audio.size(1)),
-                    'constant',
-                )
-
-        return (clean_audio.squeeze(), noisy_audio.squeeze())
-
-    def __len__(self):
-        return len(self.audio_indexes)
-
-
 def train(rank, a, h):
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
@@ -536,18 +449,8 @@ def train(rank, a, h):
         last_epoch=last_epoch,
     )
 
-    training_indexes, validation_indexes = get_dataset_filelist(a)
+    trainset, validset = build_datasets(a, h)
     world_size = h.num_gpus
-
-    trainset = Dataset(
-        training_indexes,
-        a.input_clean_wavs_dir,
-        a.input_noisy_wavs_dir,
-        h.segment_size,
-        h.sampling_rate,
-        split=True,
-        shuffle=False if h.num_gpus > 1 else True,
-    )
 
     train_sampler = DistributedSampler(trainset) if world_size > 1 else None
 
@@ -559,16 +462,6 @@ def train(rank, a, h):
         batch_size=h.batch_size,
         pin_memory=True,
         drop_last=True,
-    )
-
-    validset = Dataset(
-        validation_indexes,
-        a.input_validation_clean_wavs_dir,
-        a.input_validation_noisy_wavs_dir,
-        h.segment_size,
-        h.sampling_rate,
-        split=False,
-        shuffle=False,
     )
 
     valid_sampler = (
@@ -804,6 +697,12 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
+        '--dataset',
+        default='voicebank',
+        choices=['voicebank', 'librispeech'],
+        help='Dataset backend used by build_datasets().',
+    )
+    parser.add_argument(
         '--input_clean_wavs_dir',
         default='data/raw/VoiceBank+DEMAND/clean_trainset_56spk_wav',
     )
@@ -827,8 +726,26 @@ def main():
         '--input_validation_file',
         default='data/raw/VoiceBank+DEMAND/log_testset.txt',
     )
+    parser.add_argument(
+        '--sql_root',
+        default=None,
+        help='Reserved for --dataset librispeech (DuckDB path).',
+    )
+    parser.add_argument(
+        '--train_splits',
+        default=None,
+        nargs='+',
+        help='Reserved for --dataset librispeech (utterance split names).',
+    )
+    parser.add_argument(
+        '--noise_config_ids',
+        default=None,
+        nargs='+',
+        type=int,
+        help='Reserved for --dataset librispeech (noise_configs.id values).',
+    )
     parser.add_argument('--checkpoint_path', default=CHECKPOINT_ROOT)
-    parser.add_argument('--config', default='src/mp_senet/config_conformer.json')
+    parser.add_argument('--config', default='src/mp_senet/configs/conformer.json')
     parser.add_argument('--training_epochs', default=400, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
     parser.add_argument(
