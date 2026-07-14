@@ -20,3 +20,31 @@ python -m src.database.01_1_create_table_utterances
 ```bash
 python -m src.database.01_2_insert_utterances_from_librispeech
 ```
+
+---
+
+## Create Noises Table
+
+```bash
+python -m src.database.02_1_create_table_noises
+```
+
+### Insert Noises from *DEMAND* Dataset
+
+```bash
+python -m src.database.02_2_insert_noises_from_demand
+```
+
+---
+
+## Create Noise Configs Table
+
+```bash
+python -m src.database.03_1_create_table_noise_configs
+```
+
+### Insert Noise Configs from *DEMAND* Dataset
+
+```bash
+python -m src.database.03_2_insert_noise_configs_from_demand
+```

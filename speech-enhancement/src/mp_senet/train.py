@@ -269,12 +269,13 @@ def run_validation(
     generator.eval()
     torch.cuda.empty_cache()
 
-    audios_r, audios_g = [], []
     val_mag_err_tot = 0.0
     val_pha_err_tot = 0.0
     val_com_err_tot = 0.0
     val_stft_err_tot = 0.0
     num_batches = 0
+    pesq_sum = 0.0
+    pesq_count = 0
 
     val_pbar = None
     if rank == 0:
@@ -302,8 +303,17 @@ def run_validation(
                 outputs['com_g'],
                 outputs['com_g_hat'],
             )
-            audios_r += torch.split(clean_audio, 1, dim=0)
-            audios_g += torch.split(outputs['audio_g'], 1, dim=0)
+
+            for ref, est in zip(
+                torch.split(clean_audio, 1, dim=0),
+                torch.split(outputs['audio_g'], 1, dim=0),
+            ):
+                pesq_sum += cal_pesq(
+                    ref.squeeze().cpu().numpy(),
+                    est.squeeze().cpu().numpy(),
+                    h.sampling_rate,
+                )
+                pesq_count += 1
 
             val_mag_err_tot += errors['mag_error']
             val_pha_err_tot += errors['pha_error']
@@ -331,17 +341,6 @@ def run_validation(
     val_pha_err = aggregate_sum(val_pha_err_tot, device, world_size) / total_batches
     val_com_err = aggregate_sum(val_com_err_tot, device, world_size) / total_batches
     val_stft_err = aggregate_sum(val_stft_err_tot, device, world_size) / total_batches
-
-    pesq_sum = 0.0
-    pesq_count = 0
-    if audios_r:
-        for ref, est in zip(audios_r, audios_g):
-            pesq_sum += cal_pesq(
-                ref.squeeze().cpu().numpy(),
-                est.squeeze().cpu().numpy(),
-                h.sampling_rate,
-            )
-            pesq_count += 1
 
     total_pesq_sum = aggregate_sum(pesq_sum, device, world_size)
     total_pesq_count = aggregate_sum(pesq_count, device, world_size)
@@ -729,20 +728,26 @@ def main():
     parser.add_argument(
         '--sql_root',
         default=None,
-        help='Reserved for --dataset librispeech (DuckDB path).',
+        help='DuckDB path for --dataset librispeech (default: SQL_ROOT from env).',
     )
     parser.add_argument(
         '--train_splits',
         default=None,
         nargs='+',
-        help='Reserved for --dataset librispeech (utterance split names).',
+        help='LibriSpeech utterance splits used for training (required for librispeech).',
+    )
+    parser.add_argument(
+        '--validation_splits',
+        default=None,
+        nargs='+',
+        help='LibriSpeech utterance splits used for validation (required for librispeech).',
     )
     parser.add_argument(
         '--noise_config_ids',
         default=None,
         nargs='+',
         type=int,
-        help='Reserved for --dataset librispeech (noise_configs.id values).',
+        help='noise_configs.id values for on-the-fly mixing (default: all non-clean).',
     )
     parser.add_argument('--checkpoint_path', default=CHECKPOINT_ROOT)
     parser.add_argument('--config', default='src/mp_senet/configs/conformer.json')
@@ -765,6 +770,15 @@ def main():
     )
 
     a = parser.parse_args()
+    if a.dataset == 'librispeech':
+        if a.sql_root is None:
+            from src.config import SQL_ROOT
+            a.sql_root = str(SQL_ROOT)
+        if not a.train_splits:
+            parser.error('--train_splits is required for --dataset librispeech')
+        if not a.validation_splits:
+            parser.error('--validation_splits is required for --dataset librispeech')
+
     a.checkpoint_path = resolve_checkpoint_path(a.checkpoint_path)
     os.makedirs(a.checkpoint_path, exist_ok=True)
 
