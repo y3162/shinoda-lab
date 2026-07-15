@@ -24,12 +24,18 @@ class WhisperLargeV3(nn.Module):
         super().__init__()
 
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+            attn_implementation = 'flash_attention_2'
+        elif torch.cuda.is_available():
+            attn_implementation = 'sdpa'
+        else:
+            attn_implementation = 'eager'
         self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
             'openai/whisper-large-v3',
             low_cpu_mem_usage=True,
             use_safetensors=True,
             torch_dtype=dtype,
-            attn_implementation='flash_attention_2',
+            attn_implementation=attn_implementation,
         )
         self.processor = AutoProcessor.from_pretrained('openai/whisper-large-v3')
 
