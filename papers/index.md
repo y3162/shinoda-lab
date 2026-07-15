@@ -18,7 +18,7 @@
 
 ## Large Language Models
 
-### GPT Series
+### GPT Family
 
 | markdown | year | title |
 | :--- | :--- | :--- |
@@ -27,8 +27,9 @@
 | [GPT-3.md](./20260704_GPT-3.md) | 2020 | [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165) |
 | [InstructGPT.md](./20260707_InstructGPT.md) | 2022 | [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155) |
 
-### DeepSeek Series
+### DeepSeek Family
 
 | markdown | year | title |
 | :--- | :--- | :--- |
 | [DeepSeek-V1.md](./20260708_DeepSeek-V1.md) | 2024 | [DeepSeek LLM: Scaling Open-Source Language Models with Longtermism](https://arxiv.org/abs/2401.02954) |
+| [DeepSeekMoE.md](./20260715_DeepSeekMoE.md) | 2024 | [DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models](https://arxiv.org/abs/2401.06066) |
