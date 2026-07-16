@@ -1,0 +1,41 @@
+{
+    "batch_size": 2,
+    "learning_rate": 0.0002,
+    "adam_b1": 0.8,
+    "adam_b2": 0.99,
+    "lr_decay": 0.99,
+    "seed": 1234,
+    "num_workers": 4,
+    "segment_size": 16000,
+
+    "sampling_rate": 16000,
+    "n_fft": 400,
+    "hop_size": 100,
+    "win_size": 400,
+    "compress_factor": 0.3,
+
+    "hid_feature": 48,
+    "unet_expansion": 1,
+    "num_tfmamba": 4,
+    "d_state": 16,
+    "d_conv": 4,
+    "expand": 2,
+    "norm_epsilon": 0.00001,
+    "beta": 2.0,
+    "input_channel": 2,
+    "output_channel": 1,
+    "dropout": 0.1,
+
+    "loss_adv_g": 1.0,
+    "loss_fm_g": 1.0,
+    "loss_magnitude": 0.9,
+    "loss_phase": 0.3,
+    "loss_complex": 0.1,
+    "loss_mel": 0.1,
+    "loss_consistancy": 0.1,
+
+    "dist_config": {
+        "dist_backend": "nccl",
+        "world_size": 1
+    }
+}

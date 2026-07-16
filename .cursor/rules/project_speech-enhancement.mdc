@@ -18,4 +18,6 @@ When executing commands in the terminal, always activate the environment first:
 ```bash
 # if using MP-SENet
 source ./.venv/mp_senet_env/bin/activate
+# if using SEMamba++
+source ./.venv/se_mamba_pp_env/bin/activate
 ```
