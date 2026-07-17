@@ -582,7 +582,6 @@ def main():
         '--input_validation_file',
         default='data/raw/VoiceBank+DEMAND/log_testset.txt',
     )
-    parser.add_argument('--sql_root', default=None)
     parser.add_argument('--train_splits', default=None, nargs='+')
     parser.add_argument('--validation_splits', default=None, nargs='+')
     parser.add_argument('--noise_config_ids', default=None, nargs='+', type=int)
@@ -599,9 +598,8 @@ def main():
     a = parser.parse_args()
 
     if a.dataset == 'librispeech':
-        if a.sql_root is None:
-            from src.config import SQL_ROOT
-            a.sql_root = str(SQL_ROOT)
+        from src.config import SQL_ROOT
+        a.sql_root = str(SQL_ROOT)
         if not a.train_splits:
             parser.error('--train_splits is required for --dataset librispeech')
         if not a.validation_splits:
