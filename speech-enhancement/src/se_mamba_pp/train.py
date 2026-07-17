@@ -4,20 +4,30 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 import argparse
 import itertools
 import json
-import logging
 import os
-import shutil
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
+
+if 'LOCAL_RANK' in os.environ:
+    local_rank = int(os.environ['LOCAL_RANK'])
+    visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible_devices:
+        os.environ['CUDA_VISIBLE_DEVICES'] = visible_devices.split(',')[local_rank]
+    else:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank)
+    os.environ['SE_MAMBA_ISOLATED_DEVICE'] = '1'
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.distributed import barrier, destroy_process_group, init_process_group
+from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+if os.environ.get('SE_MAMBA_ISOLATED_DEVICE') == '1':
+    torch.cuda.set_device(0)
 
 from src.se_mamba_pp.dataset import build_datasets
 from src.se_mamba_pp.model.discriminator import (
@@ -29,8 +39,26 @@ from src.se_mamba_pp.model.discriminator import (
 )
 from src.se_mamba_pp.model.loss import MultiScaleMelSpectrogramLoss, phase_losses
 from src.se_mamba_pp.model.semambapp import SEMambapp
-from src.se_mamba_pp.model.stfts import mag_phase_istft, mag_phase_stft
-from src.se_mamba_pp.utils import AttrDict, cal_pesq, load_checkpoint, save_checkpoint
+from src.se_mamba_pp.model.stfts import forward_generator_batch
+from src.se_mamba_pp.utils import (
+    AttrDict,
+    aggregate_sum,
+    build_env,
+    cal_pesq,
+    configure_runtime,
+    device_barrier,
+    format_postfix,
+    latest_checkpoint_paths,
+    load_checkpoint,
+    make_progress_bar,
+    resolve_checkpoint_path,
+    resolve_dist_info,
+    resolve_dist_timeout_minutes,
+    save_best_checkpoint,
+    save_latest_checkpoint,
+    setup_logging,
+    worker_init_fn,
+)
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -38,204 +66,6 @@ torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
 
 CHECKPOINT_ROOT = 'data/checkpoints/se_mamba_pp'
-DEFAULT_DIST_TIMEOUT_MINUTES = 120
-
-
-def device_barrier(device, world_size):
-    if world_size > 1:
-        barrier(device_ids=[device.index])
-
-
-def configure_runtime():
-    os.environ.setdefault('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1')
-    os.environ.setdefault('NCCL_IB_DISABLE', '1')
-    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-    os.environ.setdefault('OMP_NUM_THREADS', '1')
-    os.environ.setdefault('MKL_NUM_THREADS', '1')
-    os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
-    os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
-    torch.set_num_threads(1)
-    try:
-        torch.set_num_interop_threads(1)
-    except RuntimeError:
-        pass
-
-
-def worker_init_fn(_worker_id):
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    torch.set_num_threads(1)
-
-
-def configure_distributed_runtime():
-    configure_runtime()
-
-
-def resolve_dist_info():
-    rank = int(os.environ.get('RANK', 0))
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    return rank, local_rank, world_size
-
-
-def resolve_dist_timeout_minutes(h, override_minutes=None):
-    if override_minutes is not None:
-        return override_minutes
-    return h.dist_config.get('dist_timeout_minutes', DEFAULT_DIST_TIMEOUT_MINUTES)
-
-
-def setup_logging(log_dir, rank=0):
-    logger = logging.getLogger('se_mamba_pp.train')
-    logger.handlers.clear()
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    if rank != 0:
-        logger.addHandler(logging.NullHandler())
-        return logger
-
-    os.makedirs(log_dir, exist_ok=True)
-    formatter = logging.Formatter(
-        '[%(asctime)s] %(levelname)s: %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-    )
-    file_handler = logging.FileHandler(os.path.join(log_dir, 'train.log'))
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    return logger
-
-
-def format_postfix(**kwargs):
-    formatted = {}
-    for key, value in kwargs.items():
-        if isinstance(value, float):
-            formatted[key] = f'{value:.3f}'
-        else:
-            formatted[key] = value
-    return formatted
-
-
-def resolve_checkpoint_path(checkpoint_root):
-    if os.path.isdir(checkpoint_root):
-        cp_g = os.path.join(checkpoint_root, 'g_latest')
-        cp_do = os.path.join(checkpoint_root, 'do_latest')
-        if os.path.isfile(cp_g) and os.path.isfile(cp_do):
-            return checkpoint_root
-        if os.path.isfile(os.path.join(checkpoint_root, 'config.json')):
-            return checkpoint_root
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    parent = checkpoint_root
-    if os.path.isfile(os.path.join(checkpoint_root, 'config.json')):
-        parent = os.path.dirname(checkpoint_root)
-    return os.path.join(parent, timestamp)
-
-
-def latest_checkpoint_paths(checkpoint_dir):
-    cp_g = os.path.join(checkpoint_dir, 'g_latest')
-    cp_do = os.path.join(checkpoint_dir, 'do_latest')
-    if os.path.isfile(cp_g) and os.path.isfile(cp_do):
-        return cp_g, cp_do
-    return None, None
-
-
-def save_latest_checkpoint(
-    checkpoint_path,
-    generator,
-    mssbcqtd,
-    mrd,
-    optim_g,
-    optim_d,
-    steps,
-    epoch,
-    num_gpus,
-):
-    gen = generator.module if num_gpus > 1 else generator
-    disc_q = mssbcqtd.module if num_gpus > 1 else mssbcqtd
-    disc_r = mrd.module if num_gpus > 1 else mrd
-    save_checkpoint(
-        os.path.join(checkpoint_path, 'g_latest'),
-        {'generator': gen.state_dict()},
-    )
-    save_checkpoint(
-        os.path.join(checkpoint_path, 'do_latest'),
-        {
-            'mssbcqtd': disc_q.state_dict(),
-            'mrd': disc_r.state_dict(),
-            'optim_g': optim_g.state_dict(),
-            'optim_d': optim_d.state_dict(),
-            'steps': steps,
-            'epoch': epoch,
-        },
-    )
-
-
-def save_best_checkpoint(checkpoint_path, generator, num_gpus):
-    gen = generator.module if num_gpus > 1 else generator
-    save_checkpoint(
-        os.path.join(checkpoint_path, 'g_best'),
-        {'generator': gen.state_dict()},
-    )
-
-
-def build_env(config, config_name, path):
-    t_path = os.path.join(path, config_name)
-    if config != t_path:
-        os.makedirs(path, exist_ok=True)
-        shutil.copyfile(config, os.path.join(path, config_name))
-
-
-def aggregate_sum(value, device, world_size):
-    tensor = torch.tensor([value], device=device, dtype=torch.float64)
-    if world_size > 1:
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return tensor.item()
-
-
-def forward_generator_batch(generator, clean_audio, noisy_audio, h):
-    clean_mag, clean_pha, clean_com = mag_phase_stft(
-        clean_audio,
-        h.n_fft,
-        h.hop_size,
-        h.win_size,
-        h.compress_factor,
-    )
-    noisy_mag, noisy_pha, _ = mag_phase_stft(
-        noisy_audio,
-        h.n_fft,
-        h.hop_size,
-        h.win_size,
-        h.compress_factor,
-    )
-    mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
-    audio_g = mag_phase_istft(
-        mag_g,
-        pha_g,
-        h.n_fft,
-        h.hop_size,
-        h.win_size,
-        h.compress_factor,
-    )
-    _, _, rec_com = mag_phase_stft(
-        audio_g,
-        h.n_fft,
-        h.hop_size,
-        h.win_size,
-        h.compress_factor,
-        addeps=True,
-    )
-    return {
-        'clean_mag': clean_mag,
-        'clean_pha': clean_pha,
-        'clean_com': clean_com,
-        'noisy_mag': noisy_mag,
-        'noisy_pha': noisy_pha,
-        'mag_g': mag_g,
-        'pha_g': pha_g,
-        'com_g': com_g,
-        'audio_g': audio_g,
-        'rec_com': rec_com,
-    }
 
 
 def run_validation(
@@ -262,11 +92,10 @@ def run_validation(
 
     val_pbar = None
     if rank == 0:
-        val_pbar = tqdm(
+        val_pbar = make_progress_bar(
             total=len(validation_loader),
-            unit='sample',
             desc='Validation {}/{}'.format(epoch + 1, total_epochs),
-            dynamic_ncols=True,
+            unit='sample',
             leave=False,
         )
 
@@ -498,11 +327,10 @@ def train(a, h):
             train_sampler.set_epoch(epoch)
 
         if rank == 0:
-            train_pbar = tqdm(
+            train_pbar = make_progress_bar(
                 total=len(train_loader) * h.batch_size,
-                unit='sample',
                 desc='Epoch {}/{}'.format(epoch + 1, a.training_epochs),
-                dynamic_ncols=True,
+                unit='sample',
             )
         else:
             train_pbar = None
@@ -584,44 +412,47 @@ def train(a, h):
             optim_g.step()
 
             if rank == 0:
-                if steps % a.summary_interval == 0:
-                    mag_error = loss_mag.item()
-                    pha_error = loss_pha.item()
-                    com_error = loss_com.item() / 2
-                    con_error = loss_con.item() / 2
-                    mel_error = mel_loss.item()
-                    time_error = F.l1_loss(clean_audio, audio_g).item()
-                    gen_error = loss_gen_all.item()
-                    disc_error = loss_disc_all.item()
+                train_pbar.update(h.batch_size)
+                mag_error = loss_mag.item()
+                pha_error = loss_pha.item()
+                com_error = loss_com.item() / 2
+                con_error = loss_con.item() / 2
+                mel_error = mel_loss.item()
+                gen_error = loss_gen_all.item()
+                disc_error = loss_disc_all.item()
+                adv_error = adv_g_loss.item()
+                fm_error = fm_g_loss.item()
+                postfix = format_postfix(
+                    step=steps + 1,
+                    gen=gen_error,
+                    disc=disc_error,
+                    adv=adv_error,
+                    fm=fm_error,
+                    mag=mag_error,
+                    pha=pha_error,
+                    com=com_error,
+                    mel=mel_error,
+                    con=con_error,
+                )
+                train_pbar.set_postfix(postfix, refresh=True)
 
+                if steps % a.summary_interval == 0:
+                    time_error = F.l1_loss(clean_audio, audio_g).item()
                     sw.add_scalar('Training/Generator Loss', gen_error, steps)
                     sw.add_scalar(
                         'Training/Discriminator Loss',
                         disc_error,
                         steps,
                     )
-                    sw.add_scalar('Training/adv_g_loss', adv_g_loss.item(), steps)
-                    sw.add_scalar('Training/fm_g_loss', fm_g_loss.item(), steps)
+                    sw.add_scalar('Training/adv_g_loss', adv_error, steps)
+                    sw.add_scalar('Training/fm_g_loss', fm_error, steps)
                     sw.add_scalar('Training/Magnitude Loss', mag_error, steps)
                     sw.add_scalar('Training/Phase Loss', pha_error, steps)
                     sw.add_scalar('Training/Complex Loss', com_error, steps)
                     sw.add_scalar('Training/Consistency Loss', con_error, steps)
                     sw.add_scalar('Training/Mel Loss', mel_error, steps)
                     sw.add_scalar('Training/Time Loss', time_error, steps)
-
-                    train_pbar.set_postfix(
-                        format_postfix(
-                            step=steps + 1,
-                            gen=gen_error,
-                            disc=disc_error,
-                            mag=mag_error,
-                            pha=pha_error,
-                            com=com_error,
-                            mel=mel_error,
-                        ),
-                        refresh=False,
-                    )
-                train_pbar.update(h.batch_size)
+                    logger.info('%s', train_pbar)
 
             steps += 1
 
@@ -762,6 +593,7 @@ def main():
     )
     parser.add_argument('--training_epochs', default=100, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
+    parser.add_argument('--batch_size', default=None, type=int)
     parser.add_argument('--num_workers', default=None, type=int)
     parser.add_argument('--dist_timeout_minutes', default=None, type=int)
     a = parser.parse_args()
@@ -784,6 +616,8 @@ def main():
     with open(a.config) as f:
         json_config = json.loads(f.read())
     h = AttrDict(json_config)
+    if a.batch_size is not None:
+        h.batch_size = a.batch_size
     if a.num_workers is not None:
         h.num_workers = a.num_workers
     h.rank = rank
@@ -833,7 +667,7 @@ def main():
                 torch.cuda.device_count(),
             )
 
-    torch.manual_seed(h.seed)
+    torch.random.default_generator.manual_seed(h.seed)
     torch.cuda.manual_seed(h.seed)
     train(a, h)
 

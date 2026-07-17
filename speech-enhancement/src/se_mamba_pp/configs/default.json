@@ -5,7 +5,7 @@
     "adam_b2": 0.99,
     "lr_decay": 0.99,
     "seed": 1234,
-    "num_workers": 2,
+    "num_workers": 8,
     "prefetch_factor": 2,
     "segment_size": 48000,
 

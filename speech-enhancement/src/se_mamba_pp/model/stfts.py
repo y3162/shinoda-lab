@@ -71,3 +71,49 @@ def mag_phase_istft(mag, pha, n_fft, hop_size, win_size, compress_factor=1.0, ce
                     window=hann_window, 
                     center=center)
     return wav
+
+
+def forward_generator_batch(generator, clean_audio, noisy_audio, h):
+    clean_mag, clean_pha, clean_com = mag_phase_stft(
+        clean_audio,
+        h.n_fft,
+        h.hop_size,
+        h.win_size,
+        h.compress_factor,
+    )
+    noisy_mag, noisy_pha, _ = mag_phase_stft(
+        noisy_audio,
+        h.n_fft,
+        h.hop_size,
+        h.win_size,
+        h.compress_factor,
+    )
+    mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
+    audio_g = mag_phase_istft(
+        mag_g,
+        pha_g,
+        h.n_fft,
+        h.hop_size,
+        h.win_size,
+        h.compress_factor,
+    )
+    _, _, rec_com = mag_phase_stft(
+        audio_g,
+        h.n_fft,
+        h.hop_size,
+        h.win_size,
+        h.compress_factor,
+        addeps=True,
+    )
+    return {
+        'clean_mag': clean_mag,
+        'clean_pha': clean_pha,
+        'clean_com': clean_com,
+        'noisy_mag': noisy_mag,
+        'noisy_pha': noisy_pha,
+        'mag_g': mag_g,
+        'pha_g': pha_g,
+        'com_g': com_g,
+        'audio_g': audio_g,
+        'rec_com': rec_com,
+    }

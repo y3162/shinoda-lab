@@ -9,15 +9,26 @@ import logging
 import shutil
 from datetime import datetime, timedelta
 
+if 'LOCAL_RANK' in os.environ:
+    local_rank = int(os.environ['LOCAL_RANK'])
+    visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible_devices:
+        os.environ['CUDA_VISIBLE_DEVICES'] = visible_devices.split(',')[local_rank]
+    else:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank)
+    os.environ['MP_SENET_ISOLATED_DEVICE'] = '1'
+
 import torch
 import torch.nn.functional as F
-import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DistributedSampler, DataLoader
 from torch.distributed import init_process_group, destroy_process_group, barrier
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
+
+if os.environ.get('MP_SENET_ISOLATED_DEVICE') == '1':
+    torch.cuda.set_device(0)
 
 from src.mp_senet.dataset import build_datasets
 from src.mp_senet.model.model import MPNet, phase_losses
@@ -43,13 +54,6 @@ def device_barrier(device, world_size):
 def configure_distributed_runtime():
     os.environ.setdefault('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1')
     os.environ.setdefault('NCCL_IB_DISABLE', '1')
-
-
-def dist_init_method(checkpoint_path):
-    init_file = os.path.abspath(os.path.join(checkpoint_path, '.dist_init'))
-    if os.path.isfile(init_file):
-        os.remove(init_file)
-    return 'file://' + init_file
 
 
 def resolve_dist_timeout_minutes(h, override_minutes=None):
@@ -355,20 +359,12 @@ def run_validation(
     }
 
 
-def train(rank, a, h):
-    if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
-    device = torch.device('cuda:{:d}'.format(rank))
-
-    if h.num_gpus > 1:
-        init_process_group(
-            backend=h.dist_config['dist_backend'],
-            init_method=h.dist_init_method,
-            world_size=h.dist_config['world_size'] * h.num_gpus,
-            rank=rank,
-            timeout=timedelta(minutes=h.dist_timeout_minutes),
-            device_id=device,
-        )
+def train(a, h):
+    rank = h.rank
+    local_rank = h.local_rank
+    world_size = h.num_gpus
+    torch.cuda.set_device(local_rank)
+    device = torch.device('cuda:{:d}'.format(local_rank))
 
     logger = setup_logging(a.checkpoint_path, rank=rank)
 
@@ -415,12 +411,18 @@ def train(rank, a, h):
                 state_dict_do['epoch'] + 1,
             )
 
-    if h.num_gpus > 1:
-        device_barrier(device, h.num_gpus)
+    if world_size > 1:
+        device_barrier(device, world_size)
 
-    if h.num_gpus > 1:
-        generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
-        discriminator = DistributedDataParallel(discriminator, device_ids=[rank]).to(device)
+    if world_size > 1:
+        generator = DistributedDataParallel(
+            generator,
+            device_ids=[local_rank],
+        ).to(device)
+        discriminator = DistributedDataParallel(
+            discriminator,
+            device_ids=[local_rank],
+        ).to(device)
 
     optim_g = torch.optim.AdamW(
         generator.parameters(),
@@ -449,8 +451,6 @@ def train(rank, a, h):
     )
 
     trainset, validset = build_datasets(a, h)
-    world_size = h.num_gpus
-
     train_sampler = DistributedSampler(trainset) if world_size > 1 else None
 
     train_loader = DataLoader(
@@ -493,7 +493,7 @@ def train(rank, a, h):
             start = time.time()
             logger.info('Epoch: %d', epoch + 1)
 
-        if h.num_gpus > 1:
+        if world_size > 1:
             train_sampler.set_epoch(epoch)
 
         if rank == 0:
@@ -674,8 +674,8 @@ def train(rank, a, h):
 
         generator.train()
 
-        if h.num_gpus > 1:
-            device_barrier(device, h.num_gpus)
+        if world_size > 1:
+            device_barrier(device, world_size)
 
         scheduler_g.step()
         scheduler_d.step()
@@ -688,7 +688,7 @@ def train(rank, a, h):
                 epoch_time,
             )
 
-    if h.num_gpus > 1:
+    if world_size > 1:
         destroy_process_group()
 
 
@@ -779,14 +779,17 @@ def main():
         if not a.validation_splits:
             parser.error('--validation_splits is required for --dataset librispeech')
 
-    a.checkpoint_path = resolve_checkpoint_path(a.checkpoint_path)
-    os.makedirs(a.checkpoint_path, exist_ok=True)
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA is required for training.')
 
-    logger = setup_logging(a.checkpoint_path, rank=0)
-    tqdm.write('Initializing Training Process..')
-    tqdm.write('checkpoints directory: {}'.format(a.checkpoint_path))
-    logger.info('Initializing Training Process..')
-    logger.info('checkpoints directory: %s', a.checkpoint_path)
+    rank = int(os.environ.get('RANK', 0))
+    local_rank = (
+        0
+        if os.environ.get('MP_SENET_ISOLATED_DEVICE') == '1'
+        else int(os.environ.get('LOCAL_RANK', 0))
+    )
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    torch.cuda.set_device(local_rank)
 
     with open(a.config) as f:
         data = f.read()
@@ -795,34 +798,55 @@ def main():
     h = AttrDict(json_config)
     if a.num_workers is not None:
         h.num_workers = a.num_workers
-    h.dist_init_method = dist_init_method(a.checkpoint_path)
+    h.rank = rank
+    h.local_rank = local_rank
+    h.num_gpus = world_size
+    h.dist_init_method = 'env://'
     h.dist_timeout_minutes = resolve_dist_timeout_minutes(
         h,
         override_minutes=a.dist_timeout_minutes,
     )
-    build_env(a.config, 'config.json', a.checkpoint_path)
+    h.batch_size = int(h.batch_size / h.num_gpus)
 
-    torch.manual_seed(h.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(h.seed)
-        h.num_gpus = torch.cuda.device_count()
-        h.batch_size = int(h.batch_size / h.num_gpus)
+    if h.num_gpus > 1:
+        configure_distributed_runtime()
+        init_process_group(
+            backend=h.dist_config['dist_backend'],
+            timeout=timedelta(minutes=h.dist_timeout_minutes),
+            device_id=torch.device('cuda', local_rank),
+        )
+
+    if rank == 0:
+        checkpoint_path = resolve_checkpoint_path(a.checkpoint_path)
+        os.makedirs(checkpoint_path, exist_ok=True)
+        objects = [checkpoint_path]
+    else:
+        objects = [None]
+    if h.num_gpus > 1:
+        dist.broadcast_object_list(objects, src=0)
+    a.checkpoint_path = objects[0]
+
+    if rank == 0:
+        build_env(a.config, 'config.json', a.checkpoint_path)
+        logger = setup_logging(a.checkpoint_path, rank=0)
+        tqdm.write('Initializing Training Process..')
+        tqdm.write('checkpoints directory: {}'.format(a.checkpoint_path))
+        logger.info('Initializing Training Process..')
+        logger.info('checkpoints directory: %s', a.checkpoint_path)
         tqdm.write('Batch size per GPU: {}'.format(h.batch_size))
         tqdm.write('num_workers: {}'.format(h.num_workers))
         logger.info('Batch size per GPU: %d', h.batch_size)
         logger.info('num_workers: %d', h.num_workers)
-    else:
-        raise RuntimeError('CUDA is required for training.')
 
-    if h.num_gpus > 1:
-        configure_distributed_runtime()
+    if h.num_gpus > 1 and rank == 0:
         tqdm.write('dist_init_method: {}'.format(h.dist_init_method))
         tqdm.write('dist_timeout_minutes: {}'.format(h.dist_timeout_minutes))
         logger.info('dist_init_method: %s', h.dist_init_method)
         logger.info('dist_timeout_minutes: %d', h.dist_timeout_minutes)
-        mp.spawn(train, nprocs=h.num_gpus, args=(a, h,))
-    else:
-        train(0, a, h)
+
+    torch.random.default_generator.manual_seed(h.seed)
+    torch.cuda.manual_seed(h.seed)
+    train(a, h)
 
 
 if __name__ == '__main__':
