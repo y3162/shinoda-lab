@@ -3,11 +3,37 @@ import random
 from pathlib import Path
 
 import duckdb as db
-import librosa
+import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
 
 from src.utils.noise import NoiseGenerator, get_noise_option
+
+
+def _load_wav_mono(path, sampling_rate, frame_offset=0, num_frames=-1):
+    if num_frames is None or num_frames < 0:
+        waveform, sample_rate = sf.read(path, dtype='float32', always_2d=True)
+    else:
+        waveform, sample_rate = sf.read(
+            path,
+            start=frame_offset,
+            stop=frame_offset + num_frames,
+            dtype='float32',
+            always_2d=True,
+        )
+
+    waveform = waveform.mean(axis=1) if waveform.shape[1] > 1 else waveform[:, 0]
+    waveform = torch.from_numpy(np.ascontiguousarray(waveform))
+
+    if sample_rate != sampling_rate:
+        waveform = torchaudio.functional.resample(
+            waveform,
+            sample_rate,
+            sampling_rate,
+        )
+
+    return waveform
 
 
 def get_voicebank_filelist(training_file, validation_file):
@@ -29,23 +55,32 @@ def get_voicebank_filelist(training_file, validation_file):
 
 
 def normalize_and_segment(clean_audio, noisy_audio, segment_size, split):
-    clean_audio, noisy_audio = (
-        torch.FloatTensor(clean_audio),
-        torch.FloatTensor(noisy_audio),
-    )
-    norm_factor = torch.sqrt(len(noisy_audio) / torch.sum(noisy_audio ** 2.0))
+    if not torch.is_tensor(clean_audio):
+        clean_audio = torch.as_tensor(clean_audio, dtype=torch.float32)
+    else:
+        clean_audio = clean_audio.float()
+    if not torch.is_tensor(noisy_audio):
+        noisy_audio = torch.as_tensor(noisy_audio, dtype=torch.float32)
+    else:
+        noisy_audio = noisy_audio.float()
+
+    clean_audio = clean_audio.reshape(-1)
+    noisy_audio = noisy_audio.reshape(-1)
+    length = min(clean_audio.numel(), noisy_audio.numel())
+    clean_audio = clean_audio[:length]
+    noisy_audio = noisy_audio[:length]
+
+    norm_factor = torch.sqrt(length / torch.sum(noisy_audio ** 2.0).clamp_min(1e-12))
     clean_audio = (clean_audio * norm_factor).unsqueeze(0)
     noisy_audio = (noisy_audio * norm_factor).unsqueeze(0)
 
-    assert clean_audio.size(1) == noisy_audio.size(1)
-
     if split:
-        if clean_audio.size(1) >= segment_size:
+        if clean_audio.size(1) > segment_size:
             max_audio_start = clean_audio.size(1) - segment_size
             audio_start = random.randint(0, max_audio_start)
             clean_audio = clean_audio[:, audio_start: audio_start + segment_size]
             noisy_audio = noisy_audio[:, audio_start: audio_start + segment_size]
-        else:
+        elif clean_audio.size(1) < segment_size:
             clean_audio = torch.nn.functional.pad(
                 clean_audio,
                 (0, segment_size - clean_audio.size(1)),
@@ -57,7 +92,7 @@ def normalize_and_segment(clean_audio, noisy_audio, segment_size, split):
                 'constant',
             )
 
-    return clean_audio.squeeze(), noisy_audio.squeeze()
+    return clean_audio.squeeze(0), noisy_audio.squeeze(0)
 
 
 class VoiceBankPairDataset(torch.utils.data.Dataset):
@@ -76,20 +111,41 @@ class VoiceBankPairDataset(torch.utils.data.Dataset):
         self.segment_size = segment_size
         self.sampling_rate = sampling_rate
         self.split = split
+        self.num_frames = []
+        for filename in training_indexes:
+            clean_info = sf.info(os.path.join(clean_wavs_dir, filename + '.wav'))
+            noisy_info = sf.info(os.path.join(noisy_wavs_dir, filename + '.wav'))
+            self.num_frames.append(min(clean_info.frames, noisy_info.frames))
 
     def __getitem__(self, index):
         filename = self.audio_indexes[index]
-        clean_audio, _ = librosa.load(
-            os.path.join(self.clean_wavs_dir, filename + '.wav'),
-            sr=self.sampling_rate,
-        )
-        noisy_audio, _ = librosa.load(
-            os.path.join(self.noisy_wavs_dir, filename + '.wav'),
-            sr=self.sampling_rate,
-        )
-        length = min(len(clean_audio), len(noisy_audio))
-        clean_audio, noisy_audio = clean_audio[:length], noisy_audio[:length]
+        clean_path = os.path.join(self.clean_wavs_dir, filename + '.wav')
+        noisy_path = os.path.join(self.noisy_wavs_dir, filename + '.wav')
+        num_frames = self.num_frames[index]
 
+        if self.split and num_frames >= self.segment_size:
+            frame_offset = random.randint(0, num_frames - self.segment_size)
+            clean_audio = _load_wav_mono(
+                clean_path,
+                self.sampling_rate,
+                frame_offset=frame_offset,
+                num_frames=self.segment_size,
+            )
+            noisy_audio = _load_wav_mono(
+                noisy_path,
+                self.sampling_rate,
+                frame_offset=frame_offset,
+                num_frames=self.segment_size,
+            )
+            return normalize_and_segment(
+                clean_audio,
+                noisy_audio,
+                self.segment_size,
+                split=False,
+            )
+
+        clean_audio = _load_wav_mono(clean_path, self.sampling_rate)
+        noisy_audio = _load_wav_mono(noisy_path, self.sampling_rate)
         return normalize_and_segment(
             clean_audio,
             noisy_audio,
@@ -238,24 +294,71 @@ class LibriSpeechNoiseDataset(torch.utils.data.Dataset):
         return len(self.utterances)
 
 
+def _count_wavs(directory):
+    directory = Path(directory)
+    if not directory.is_dir():
+        return 0
+    return sum(1 for _ in directory.glob('*.wav'))
+
+
+def _voicebank_audio_dir(raw_dir, sampling_rate):
+    raw_dir = Path(raw_dir)
+    raw_count = _count_wavs(raw_dir)
+    if raw_count == 0:
+        return str(raw_dir)
+
+    candidates = []
+    env_root = os.environ.get('VOICEBANK_16K_ROOT')
+    if env_root:
+        candidates.append(Path(env_root) / raw_dir.name)
+    candidates.append(Path('/tmp/seki') / 'VoiceBank+DEMAND_{}'.format(sampling_rate) / raw_dir.name)
+    candidates.append(
+        Path('data')
+        / 'processed'
+        / 'VoiceBank+DEMAND_{}'.format(sampling_rate)
+        / raw_dir.name
+    )
+
+    for cache_dir in candidates:
+        if _count_wavs(cache_dir) >= raw_count:
+            return str(cache_dir)
+    return str(raw_dir)
+
+
 def build_datasets(args, h):
     if args.dataset == 'voicebank':
         training_indexes, validation_indexes = get_voicebank_filelist(
             args.input_training_file,
             args.input_validation_file,
         )
+        train_clean_dir = _voicebank_audio_dir(
+            args.input_clean_wavs_dir,
+            h.sampling_rate,
+        )
+        train_noisy_dir = _voicebank_audio_dir(
+            args.input_noisy_wavs_dir,
+            h.sampling_rate,
+        )
+        valid_clean_dir = _voicebank_audio_dir(
+            args.input_validation_clean_wavs_dir,
+            h.sampling_rate,
+        )
+        valid_noisy_dir = _voicebank_audio_dir(
+            args.input_validation_noisy_wavs_dir,
+            h.sampling_rate,
+        )
         trainset = VoiceBankPairDataset(
             training_indexes,
-            args.input_clean_wavs_dir,
-            args.input_noisy_wavs_dir,
+            train_clean_dir,
+            train_noisy_dir,
             h.segment_size,
             h.sampling_rate,
             split=True,
         )
         validset = VoiceBankPairDataset(
             validation_indexes,
-            args.input_validation_clean_wavs_dir,
-            args.input_validation_noisy_wavs_dir,
+            valid_clean_dir,
+            valid_noisy_dir,
             h.segment_size,
             h.sampling_rate,
             split=False,

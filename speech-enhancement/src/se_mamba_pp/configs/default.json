@@ -1,12 +1,13 @@
 {
-    "batch_size": 2,
+    "batch_size": 16,
     "learning_rate": 0.0002,
     "adam_b1": 0.8,
     "adam_b2": 0.99,
     "lr_decay": 0.99,
     "seed": 1234,
-    "num_workers": 4,
-    "segment_size": 16000,
+    "num_workers": 2,
+    "prefetch_factor": 2,
+    "segment_size": 48000,
 
     "sampling_rate": 16000,
     "n_fft": 400,

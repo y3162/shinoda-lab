@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.distributed import barrier, destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel
@@ -34,6 +33,9 @@ from src.se_mamba_pp.model.stfts import mag_phase_istft, mag_phase_stft
 from src.se_mamba_pp.utils import AttrDict, cal_pesq, load_checkpoint, save_checkpoint
 
 torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
 
 CHECKPOINT_ROOT = 'data/checkpoints/se_mamba_pp'
 DEFAULT_DIST_TIMEOUT_MINUTES = 120
@@ -44,16 +46,36 @@ def device_barrier(device, world_size):
         barrier(device_ids=[device.index])
 
 
-def configure_distributed_runtime():
+def configure_runtime():
     os.environ.setdefault('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1')
     os.environ.setdefault('NCCL_IB_DISABLE', '1')
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    os.environ.setdefault('MKL_NUM_THREADS', '1')
+    os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+    os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
 
 
-def dist_init_method(checkpoint_path):
-    init_file = os.path.abspath(os.path.join(checkpoint_path, '.dist_init'))
-    if os.path.isfile(init_file):
-        os.remove(init_file)
-    return 'file://' + init_file
+def worker_init_fn(_worker_id):
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    torch.set_num_threads(1)
+
+
+def configure_distributed_runtime():
+    configure_runtime()
+
+
+def resolve_dist_info():
+    rank = int(os.environ.get('RANK', 0))
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    return rank, local_rank, world_size
 
 
 def resolve_dist_timeout_minutes(h, override_minutes=None):
@@ -337,20 +359,13 @@ def run_validation(
     }
 
 
-def train(rank, a, h):
-    if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
-    device = torch.device('cuda:{:d}'.format(rank))
-
-    if h.num_gpus > 1:
-        init_process_group(
-            backend=h.dist_config['dist_backend'],
-            init_method=h.dist_init_method,
-            world_size=h.dist_config['world_size'] * h.num_gpus,
-            rank=rank,
-            timeout=timedelta(minutes=h.dist_timeout_minutes),
-            device_id=device,
-        )
+def train(a, h):
+    configure_runtime()
+    rank = h.rank
+    local_rank = h.local_rank
+    world_size = h.num_gpus
+    device = torch.device('cuda', local_rank)
+    torch.cuda.set_device(local_rank)
 
     logger = setup_logging(a.checkpoint_path, rank=rank)
     torch.cuda.manual_seed(h.seed)
@@ -398,21 +413,27 @@ def train(rank, a, h):
                 state_dict_do['epoch'] + 1,
             )
 
-    if h.num_gpus > 1:
-        device_barrier(device, h.num_gpus)
-        generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
-        mssbcqtd = DistributedDataParallel(mssbcqtd, device_ids=[rank]).to(device)
-        mrd = DistributedDataParallel(mrd, device_ids=[rank]).to(device)
+    if world_size > 1:
+        device_barrier(device, world_size)
+        ddp_kwargs = {
+            'device_ids': [local_rank],
+            'output_device': local_rank,
+            'broadcast_buffers': False,
+            'static_graph': True,
+        }
+        generator = DistributedDataParallel(generator, **ddp_kwargs)
+        mssbcqtd = DistributedDataParallel(mssbcqtd, **ddp_kwargs)
+        mrd = DistributedDataParallel(mrd, **ddp_kwargs)
 
-    optim_g = torch.optim.AdamW(
-        generator.parameters(),
-        h.learning_rate,
-        betas=[h.adam_b1, h.adam_b2],
-    )
+    adamw_kwargs = {
+        'lr': h.learning_rate,
+        'betas': [h.adam_b1, h.adam_b2],
+        'fused': True,
+    }
+    optim_g = torch.optim.AdamW(generator.parameters(), **adamw_kwargs)
     optim_d = torch.optim.AdamW(
         itertools.chain(mrd.parameters(), mssbcqtd.parameters()),
-        h.learning_rate,
-        betas=[h.adam_b1, h.adam_b2],
+        **adamw_kwargs,
     )
 
     if state_dict_do is not None:
@@ -431,29 +452,30 @@ def train(rank, a, h):
     )
 
     trainset, validset = build_datasets(a, h)
-    world_size = h.num_gpus
+    if rank == 0 and a.dataset == 'voicebank':
+        logger.info('train clean dir: %s', trainset.clean_wavs_dir)
+        logger.info('train noisy dir: %s', trainset.noisy_wavs_dir)
+        logger.info('valid clean dir: %s', validset.clean_wavs_dir)
+        logger.info('valid noisy dir: %s', validset.noisy_wavs_dir)
     train_sampler = DistributedSampler(trainset) if world_size > 1 else None
+    loader_kwargs = {}
+    if h.num_workers > 0:
+        loader_kwargs['persistent_workers'] = True
+        loader_kwargs['prefetch_factor'] = getattr(h, 'prefetch_factor', 2)
+        loader_kwargs['worker_init_fn'] = worker_init_fn
     train_loader = DataLoader(
         trainset,
         num_workers=h.num_workers,
-        shuffle=False,
+        shuffle=(train_sampler is None),
         sampler=train_sampler,
         batch_size=h.batch_size,
         pin_memory=True,
         drop_last=True,
+        **loader_kwargs,
     )
     valid_sampler = (
         DistributedSampler(validset, shuffle=False, drop_last=False)
         if world_size > 1 else None
-    )
-    validation_loader = DataLoader(
-        validset,
-        num_workers=max(1, h.num_workers // 2),
-        shuffle=False,
-        sampler=valid_sampler,
-        batch_size=1,
-        pin_memory=True,
-        drop_last=False,
     )
 
     sw = None
@@ -472,7 +494,7 @@ def train(rank, a, h):
             start = time.time()
             logger.info('Epoch: %d', epoch + 1)
 
-        if h.num_gpus > 1:
+        if world_size > 1:
             train_sampler.set_epoch(epoch)
 
         if rank == 0:
@@ -505,7 +527,7 @@ def train(rank, a, h):
             audio_g = outputs['audio_g']
             rec_com = outputs['rec_com']
 
-            optim_d.zero_grad()
+            optim_d.zero_grad(set_to_none=True)
             y_dq_hat_r, y_dq_hat_g, _, _ = mssbcqtd(
                 clean_audio.unsqueeze(1),
                 audio_g.unsqueeze(1).detach(),
@@ -520,7 +542,7 @@ def train(rank, a, h):
             loss_disc_all.backward()
             optim_d.step()
 
-            optim_g.zero_grad()
+            optim_g.zero_grad(set_to_none=True)
             y_dq_hat_r, y_dq_hat_g, fmap_q_r, fmap_q_g = mssbcqtd(
                 clean_audio.unsqueeze(1),
                 audio_g.unsqueeze(1),
@@ -562,28 +584,24 @@ def train(rank, a, h):
             optim_g.step()
 
             if rank == 0:
-                with torch.no_grad():
-                    mag_error = F.mse_loss(clean_mag, mag_g).item()
-                    ip_error, gd_error, iaf_error = phase_losses(
-                        clean_pha,
-                        pha_g,
-                        h,
-                    )
-                    pha_error = (ip_error + gd_error + iaf_error).item()
-                    com_error = F.mse_loss(clean_com, com_g).item()
-                    con_error = F.mse_loss(com_g, rec_com).item()
+                if steps % a.summary_interval == 0:
+                    mag_error = loss_mag.item()
+                    pha_error = loss_pha.item()
+                    com_error = loss_com.item() / 2
+                    con_error = loss_con.item() / 2
                     mel_error = mel_loss.item()
                     time_error = F.l1_loss(clean_audio, audio_g).item()
+                    gen_error = loss_gen_all.item()
+                    disc_error = loss_disc_all.item()
 
-                if steps % a.summary_interval == 0:
-                    sw.add_scalar('Training/Generator Loss', loss_gen_all, steps)
+                    sw.add_scalar('Training/Generator Loss', gen_error, steps)
                     sw.add_scalar(
                         'Training/Discriminator Loss',
-                        loss_disc_all,
+                        disc_error,
                         steps,
                     )
-                    sw.add_scalar('Training/adv_g_loss', float(adv_g_loss), steps)
-                    sw.add_scalar('Training/fm_g_loss', float(fm_g_loss), steps)
+                    sw.add_scalar('Training/adv_g_loss', adv_g_loss.item(), steps)
+                    sw.add_scalar('Training/fm_g_loss', fm_g_loss.item(), steps)
                     sw.add_scalar('Training/Magnitude Loss', mag_error, steps)
                     sw.add_scalar('Training/Phase Loss', pha_error, steps)
                     sw.add_scalar('Training/Complex Loss', com_error, steps)
@@ -591,18 +609,18 @@ def train(rank, a, h):
                     sw.add_scalar('Training/Mel Loss', mel_error, steps)
                     sw.add_scalar('Training/Time Loss', time_error, steps)
 
-                train_pbar.set_postfix(
-                    format_postfix(
-                        step=steps + 1,
-                        gen=float(loss_gen_all),
-                        disc=float(loss_disc_all),
-                        mag=mag_error,
-                        pha=pha_error,
-                        com=com_error,
-                        mel=mel_error,
-                    ),
-                    refresh=False,
-                )
+                    train_pbar.set_postfix(
+                        format_postfix(
+                            step=steps + 1,
+                            gen=gen_error,
+                            disc=disc_error,
+                            mag=mag_error,
+                            pha=pha_error,
+                            com=com_error,
+                            mel=mel_error,
+                        ),
+                        refresh=False,
+                    )
                 train_pbar.update(h.batch_size)
 
             steps += 1
@@ -610,6 +628,15 @@ def train(rank, a, h):
         if rank == 0:
             train_pbar.close()
 
+        validation_loader = DataLoader(
+            validset,
+            num_workers=0,
+            shuffle=False,
+            sampler=valid_sampler,
+            batch_size=1,
+            pin_memory=True,
+            drop_last=False,
+        )
         val_metrics = run_validation(
             generator,
             validation_loader,
@@ -620,6 +647,7 @@ def train(rank, a, h):
             epoch=epoch,
             total_epochs=a.training_epochs,
         )
+        del validation_loader
 
         if rank == 0:
             val_message = (
@@ -674,8 +702,8 @@ def train(rank, a, h):
             logger.info(checkpoint_message)
 
         generator.train()
-        if h.num_gpus > 1:
-            device_barrier(device, h.num_gpus)
+        if world_size > 1:
+            device_barrier(device, world_size)
 
         scheduler_g.step()
         scheduler_d.step()
@@ -687,11 +715,12 @@ def train(rank, a, h):
                 int(time.time() - start),
             )
 
-    if h.num_gpus > 1:
+    if world_size > 1:
         destroy_process_group()
 
 
 def main():
+    configure_runtime()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--dataset',
@@ -746,46 +775,67 @@ def main():
         if not a.validation_splits:
             parser.error('--validation_splits is required for --dataset librispeech')
 
-    a.checkpoint_path = resolve_checkpoint_path(a.checkpoint_path)
-    os.makedirs(a.checkpoint_path, exist_ok=True)
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA is required for training.')
 
-    logger = setup_logging(a.checkpoint_path, rank=0)
-    tqdm.write('Initializing Training Process..')
-    tqdm.write('checkpoints directory: {}'.format(a.checkpoint_path))
-    logger.info('Initializing Training Process..')
-    logger.info('checkpoints directory: %s', a.checkpoint_path)
+    rank, local_rank, world_size = resolve_dist_info()
+    torch.cuda.set_device(local_rank)
 
     with open(a.config) as f:
         json_config = json.loads(f.read())
     h = AttrDict(json_config)
     if a.num_workers is not None:
         h.num_workers = a.num_workers
-    h.dist_init_method = dist_init_method(a.checkpoint_path)
+    h.rank = rank
+    h.local_rank = local_rank
+    h.num_gpus = world_size
     h.dist_timeout_minutes = resolve_dist_timeout_minutes(
         h,
         override_minutes=a.dist_timeout_minutes,
     )
-    build_env(a.config, 'config.json', a.checkpoint_path)
+    h.batch_size = max(1, int(h.batch_size // world_size))
+
+    if world_size > 1:
+        init_process_group(
+            backend=h.dist_config['dist_backend'],
+            timeout=timedelta(minutes=h.dist_timeout_minutes),
+            device_id=torch.device('cuda', local_rank),
+        )
+
+    if rank == 0:
+        checkpoint_path = resolve_checkpoint_path(a.checkpoint_path)
+        os.makedirs(checkpoint_path, exist_ok=True)
+        objects = [checkpoint_path]
+    else:
+        objects = [None]
+    if world_size > 1:
+        dist.broadcast_object_list(objects, src=0)
+    a.checkpoint_path = objects[0]
+
+    if rank == 0:
+        build_env(a.config, 'config.json', a.checkpoint_path)
+        logger = setup_logging(a.checkpoint_path, rank=0)
+        tqdm.write('Initializing Training Process..')
+        tqdm.write('checkpoints directory: {}'.format(a.checkpoint_path))
+        tqdm.write('Batch size per GPU: {}'.format(h.batch_size))
+        tqdm.write('num_workers: {}'.format(h.num_workers))
+        tqdm.write('world_size: {}'.format(world_size))
+        logger.info('Initializing Training Process..')
+        logger.info('checkpoints directory: %s', a.checkpoint_path)
+        logger.info('Batch size per GPU: %d', h.batch_size)
+        logger.info('num_workers: %d', h.num_workers)
+        logger.info('world_size: %d', world_size)
+        if world_size == 1 and torch.cuda.device_count() > 1:
+            logger.info(
+                'Detected %d GPUs but WORLD_SIZE=1. '
+                'Use torchrun --nproc_per_node=%d for multi-GPU.',
+                torch.cuda.device_count(),
+                torch.cuda.device_count(),
+            )
 
     torch.manual_seed(h.seed)
-    if not torch.cuda.is_available():
-        raise RuntimeError('CUDA is required for training.')
-
     torch.cuda.manual_seed(h.seed)
-    h.num_gpus = torch.cuda.device_count()
-    h.batch_size = int(h.batch_size / h.num_gpus)
-    tqdm.write('Batch size per GPU: {}'.format(h.batch_size))
-    tqdm.write('num_workers: {}'.format(h.num_workers))
-    logger.info('Batch size per GPU: %d', h.batch_size)
-    logger.info('num_workers: %d', h.num_workers)
-
-    if h.num_gpus > 1:
-        configure_distributed_runtime()
-        tqdm.write('dist_init_method: {}'.format(h.dist_init_method))
-        logger.info('dist_init_method: %s', h.dist_init_method)
-        mp.spawn(train, nprocs=h.num_gpus, args=(a, h))
-    else:
-        train(0, a, h)
+    train(a, h)
 
 
 if __name__ == '__main__':
