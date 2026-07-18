@@ -18,6 +18,12 @@
 
 ## Large Language Models
 
+### Architecture
+
+| markdown | year | title |
+| :--- | :--- | :--- |
+| [Mamba.md](./20260718_Mamba.md) | 2023 | [Mamba: Linear-Time Sequence Modeling with Selective State Spaces](https://arxiv.org/abs/2312.00752) |
+
 ### GPT Family
 
 | markdown | year | title |
