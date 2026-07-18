@@ -52,3 +52,28 @@ python -m src.train.train_tokenizer \
     --vocab_size 8192 \
     --input_sentence_size 5000000
 ```
+
+---
+
+## Train NTP (*clean2noisy*)
+
+Defaults are loaded from the config JSON.
+CLI arguments override the corresponding config values.
+
+```bash
+python -m src.train.ntp \
+    --config src/configs/clean2noisy_base.json
+```
+
+Checkpoints are written under `data/checkpoints/clean2noisy/<YYYYMMDD_HHMMSS>/`.
+
+---
+
+## Train NTP (*noisy2clean*)
+
+```bash
+python -m src.train.ntp \
+    --config src/configs/noisy2clean_base.json
+```
+
+Checkpoints are written under `data/checkpoints/noisy2clean/<YYYYMMDD_HHMMSS>/`.
