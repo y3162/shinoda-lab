@@ -1,14 +1,29 @@
 ## Train *MP-SENet* (Conformer, VoiceBank+DEMAND)
 
-Defaults are loaded from the config JSON.
-`--dataset` defaults to `voicebank`.
+Defaults are loaded from `src/mp_senet/configs/conformer.json`.
+Nested keys can be overridden with dotted CLI flags (for example `--train.env.batch_size 4`).
 
 ```bash
 python -m src.mp_senet.train \
     --config src/mp_senet/configs/conformer.json
 ```
 
-Checkpoints are written under `data/checkpoints/mp_senet/<YYYYMMDD_HHMMSS>/`.
+Checkpoints, `config.json`, and TensorBoard logs are written under
+`data/checkpoints/mp_senet/<YYYYMMDD_HHMMSS>/`.
+Stdout progress uses `print_log` and tqdm; TensorBoard is under `<run>/logs/`.
+
+Optional: `--train.env.max_steps N` stops after `N` optimizer steps (useful for smoke tests).
+
+### Resume
+
+Resume creates a **new** run directory (non-destructive), copies
+`g_latest` / `do_latest` / `g_best` / `logs/` from the previous run, and continues.
+CLI overrides are allowed.
+
+```bash
+python -m src.mp_senet.train \
+    --resume data/checkpoints/mp_senet/<YYYYMMDD_HHMMSS>
+```
 
 ---
 
@@ -23,16 +38,18 @@ python -m src.mp_senet.train \
 
 ## Train *MP-SENet* (LibriSpeech)
 
-`--train_splits` and `--validation_splits` are required for `--dataset librispeech`.
-If `--noise_config_ids` is omitted, all non-clean noise configs are used.
+Set dataset and splits via config or CLI:
 
 ```bash
 python -m src.mp_senet.train \
-    --dataset librispeech \
     --config src/mp_senet/configs/conformer.json \
-    --train_splits train-clean-360 \
-    --validation_splits dev-clean
+    --data.dataset librispeech \
+    --data.librispeech.train_splits train-clean-360 \
+    --data.librispeech.validation_splits dev-clean
 ```
+
+If `data.librispeech.sql_root` is null, `SQL_ROOT` from `src.config` is used.
+If `data.librispeech.noise_config_ids` is null, all non-clean noise configs are used.
 
 ---
 

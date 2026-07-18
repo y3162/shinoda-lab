@@ -157,7 +157,7 @@ class DenseEncoder(nn.Module):
 
 
 class MaskDecoder(nn.Module):
-    def __init__(self, h, out_channel=1):
+    def __init__(self, h, n_fft, out_channel=1):
         super().__init__()
 
         self.dense_block = DenseBlock(h, depth=4)
@@ -170,7 +170,7 @@ class MaskDecoder(nn.Module):
         )
 
         self.lsigmoid = LearnableSigmoid2d(
-            h.n_fft // 2 + 1,
+            n_fft // 2 + 1,
             beta=h.beta,
         )
 
@@ -255,7 +255,7 @@ class TSTransformerBlock(nn.Module):
 
 
 class MPNet(nn.Module):
-    def __init__(self, h, num_tsblocks=None):
+    def __init__(self, h, n_fft, num_tsblocks=None):
         super().__init__()
 
         self.h = h
@@ -271,7 +271,7 @@ class MPNet(nn.Module):
             [TSTransformerBlock(h) for _ in range(num_tsblocks)]
         )
 
-        self.mask_decoder = MaskDecoder(h, out_channel=1)
+        self.mask_decoder = MaskDecoder(h, n_fft, out_channel=1)
         self.phase_decoder = PhaseDecoder(h, out_channel=1)
 
     def forward(self, noisy_amp, noisy_pha):

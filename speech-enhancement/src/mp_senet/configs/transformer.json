@@ -1,29 +1,59 @@
 {
-    "batch_size": 16,
-    "learning_rate": 0.0005,
-    "adam_b1": 0.8,
-    "adam_b2": 0.99,
-    "lr_decay": 0.99,
-    "seed": 1234,
-
-    "dense_channel": 64,
-    "compress_factor": 0.3,
-    "beta": 2.0,
-
-    "bridge_block_type": "transformer",
-    "num_tsblocks": 4,
-    "n_heads": 4,
-
-    "sampling_rate": 16000,
-    "segment_size": 32000,
-    "n_fft": 400,
-    "hop_size": 100,
-    "win_size": 400,
-
-    "num_workers": 4,
-
-    "dist_config": {
-        "dist_backend": "nccl",
-        "world_size": 1
+    "checkpoint_root": "data/checkpoints/mp_senet",
+    "data": {
+        "dataset": "voicebank",
+        "sampling_rate": 16000,
+        "segment_size": 32000,
+        "stft": {
+            "n_fft": 400,
+            "hop_size": 100,
+            "win_size": 400,
+            "compress_factor": 0.3
+        },
+        "voicebank": {
+            "clean_train_dir": "data/raw/VoiceBank+DEMAND/clean_trainset_56spk_wav",
+            "noisy_train_dir": "data/raw/VoiceBank+DEMAND/noisy_trainset_56spk_wav",
+            "clean_valid_dir": "data/raw/VoiceBank+DEMAND/clean_testset_wav",
+            "noisy_valid_dir": "data/raw/VoiceBank+DEMAND/noisy_testset_wav",
+            "train_file": "data/raw/VoiceBank+DEMAND/log_trainset_56spk.txt",
+            "valid_file": "data/raw/VoiceBank+DEMAND/log_testset.txt"
+        },
+        "librispeech": {
+            "sql_root": null,
+            "train_splits": null,
+            "validation_splits": null,
+            "noise_config_ids": null
+        }
+    },
+    "model": {
+        "dense_channel": 64,
+        "beta": 2.0,
+        "bridge_block_type": "transformer",
+        "num_tsblocks": 4,
+        "n_heads": 4
+    },
+    "train": {
+        "env": {
+            "batch_size": 16,
+            "seed": 42,
+            "num_workers": 4,
+            "epochs": 400,
+            "summary_interval": 100,
+            "max_steps": null
+        },
+        "optim": {
+            "learning_rate": 0.0005,
+            "adam_b1": 0.8,
+            "adam_b2": 0.99,
+            "lr_decay": 0.99
+        },
+        "loss": {
+            "magnitude": 0.9,
+            "phase": 0.3,
+            "complex": 0.1,
+            "stft": 0.1,
+            "metric": 0.05,
+            "time": 0.2
+        }
     }
 }

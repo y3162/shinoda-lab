@@ -7,9 +7,6 @@ import librosa
 import torch
 import torchaudio
 
-from src.utils.noise import NoiseGenerator, get_noise_option
-
-
 def get_voicebank_filelist(training_file, validation_file):
     with open(training_file, 'r', encoding='utf-8') as fi:
         training_indexes = [
@@ -153,6 +150,8 @@ def _load_noise_options(con, noise_config_ids):
     if not noise_config_ids:
         raise ValueError('No noise_config_ids available for LibriSpeechNoiseDataset')
 
+    from src.utils.noise import get_noise_option
+
     options = []
     for noise_config_id in noise_config_ids:
         option = get_noise_option(con, noise_config_id)
@@ -212,6 +211,8 @@ class LibriSpeechNoiseDataset(torch.utils.data.Dataset):
         return waveform
 
     def __getitem__(self, index):
+        from src.utils.noise import NoiseGenerator
+
         _, audio_path = self.utterances[index]
         clean_audio = self._load_clean_audio(audio_path)
 
@@ -238,62 +239,63 @@ class LibriSpeechNoiseDataset(torch.utils.data.Dataset):
         return len(self.utterances)
 
 
-def build_datasets(args, h):
-    if args.dataset == 'voicebank':
+def build_datasets(config):
+    data = config.data
+    if data.dataset == 'voicebank':
+        vb = data.voicebank
         training_indexes, validation_indexes = get_voicebank_filelist(
-            args.input_training_file,
-            args.input_validation_file,
+            vb.train_file,
+            vb.valid_file,
         )
         trainset = VoiceBankPairDataset(
             training_indexes,
-            args.input_clean_wavs_dir,
-            args.input_noisy_wavs_dir,
-            h.segment_size,
-            h.sampling_rate,
+            vb.clean_train_dir,
+            vb.noisy_train_dir,
+            data.segment_size,
+            data.sampling_rate,
             split=True,
         )
         validset = VoiceBankPairDataset(
             validation_indexes,
-            args.input_validation_clean_wavs_dir,
-            args.input_validation_noisy_wavs_dir,
-            h.segment_size,
-            h.sampling_rate,
+            vb.clean_valid_dir,
+            vb.noisy_valid_dir,
+            data.segment_size,
+            data.sampling_rate,
             split=False,
         )
         return trainset, validset
 
-    if args.dataset == 'librispeech':
-        if not args.train_splits:
-            raise ValueError('--train_splits is required for --dataset librispeech')
-        if not args.validation_splits:
-            raise ValueError(
-                '--validation_splits is required for --dataset librispeech'
-            )
-        if args.sql_root is None:
-            raise ValueError('--sql_root is required for --dataset librispeech')
+    if data.dataset == 'librispeech':
+        ls = data.librispeech
+        if not ls.train_splits:
+            raise ValueError('data.librispeech.train_splits is required')
+        if not ls.validation_splits:
+            raise ValueError('data.librispeech.validation_splits is required')
+        if ls.sql_root is None:
+            raise ValueError('data.librispeech.sql_root is required')
 
-        sql_root = Path(args.sql_root)
+        sql_root = Path(ls.sql_root)
         con = db.connect(str(sql_root), read_only=True)
-        max_frames = _max_frame_count(con, args.train_splits)
+        max_frames = _max_frame_count(con, ls.train_splits)
         con.close()
 
         trainset = LibriSpeechNoiseDataset(
             sql_root,
-            args.train_splits,
-            h.segment_size,
-            h.sampling_rate,
-            noise_config_ids=args.noise_config_ids,
+            ls.train_splits,
+            data.segment_size,
+            data.sampling_rate,
+            noise_config_ids=ls.noise_config_ids,
             split=True,
         )
         validset = LibriSpeechNoiseDataset(
             sql_root,
-            args.validation_splits,
-            h.segment_size,
-            h.sampling_rate,
-            noise_config_ids=args.noise_config_ids,
+            ls.validation_splits,
+            data.segment_size,
+            data.sampling_rate,
+            noise_config_ids=ls.noise_config_ids,
             split=False,
             max_frames=max_frames,
         )
         return trainset, validset
 
-    raise ValueError('Unsupported dataset: {}'.format(args.dataset))
+    raise ValueError('Unsupported dataset: {}'.format(data.dataset))

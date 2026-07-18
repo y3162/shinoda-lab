@@ -1,156 +1,137 @@
-import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
-
-import os
-import time
 import argparse
 import json
-import logging
 import shutil
 from datetime import datetime, timedelta
-
-if 'LOCAL_RANK' in os.environ:
-    local_rank = int(os.environ['LOCAL_RANK'])
-    visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-    if visible_devices:
-        os.environ['CUDA_VISIBLE_DEVICES'] = visible_devices.split(',')[local_rank]
-    else:
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank)
-    os.environ['MP_SENET_ISOLATED_DEVICE'] = '1'
+from pathlib import Path
 
 import torch
-import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DistributedSampler, DataLoader
-from torch.distributed import init_process_group, destroy_process_group, barrier
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-if os.environ.get('MP_SENET_ISOLATED_DEVICE') == '1':
-    torch.cuda.set_device(0)
-
 from src.mp_senet.dataset import build_datasets
-from src.mp_senet.model.model import MPNet, phase_losses
 from src.mp_senet.model.discriminator import MetricDiscriminator
+from src.mp_senet.model.model import MPNet, phase_losses
 from src.mp_senet.utils import (
-    AttrDict,
-    load_checkpoint,
-    save_checkpoint,
+    aggregate_sum,
+    apply_overrides,
     cal_pesq,
+    configure_runtime,
+    format_postfix,
+    json_to_namespace,
+    load_checkpoint,
+    make_progress_bar,
+    namespace_to_dict,
+    override_json_with_args,
+    resolve_dist_info,
+    save_best_checkpoint,
+    save_latest_checkpoint,
 )
+from src.utils.print import print_log
 
 torch.backends.cudnn.benchmark = True
 
-CHECKPOINT_ROOT = 'data/checkpoints/mp_senet'
-DEFAULT_DIST_TIMEOUT_MINUTES = 120
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default='src/mp_senet/configs/conformer.json')
+    parser.add_argument('--resume', default=None)
+    parser.add_argument('--checkpoint_root', default=None)
+    for name, typ in [
+        ('data.dataset', str),
+        ('data.sampling_rate', int),
+        ('data.segment_size', int),
+        ('data.stft.n_fft', int),
+        ('data.stft.hop_size', int),
+        ('data.stft.win_size', int),
+        ('data.stft.compress_factor', float),
+        ('data.voicebank.clean_train_dir', str),
+        ('data.voicebank.noisy_train_dir', str),
+        ('data.voicebank.clean_valid_dir', str),
+        ('data.voicebank.noisy_valid_dir', str),
+        ('data.voicebank.train_file', str),
+        ('data.voicebank.valid_file', str),
+        ('data.librispeech.sql_root', str),
+        ('model.dense_channel', int),
+        ('model.beta', float),
+        ('model.bridge_block_type', str),
+        ('model.num_tsblocks', int),
+        ('model.n_heads', int),
+        ('model.ffm_mult', int),
+        ('model.ccm_expansion_factor', int),
+        ('model.ccm_kernel_size', int),
+        ('train.env.batch_size', int),
+        ('train.env.seed', int),
+        ('train.env.num_workers', int),
+        ('train.env.epochs', int),
+        ('train.env.summary_interval', int),
+        ('train.env.max_steps', int),
+        ('train.optim.learning_rate', float),
+        ('train.optim.adam_b1', float),
+        ('train.optim.adam_b2', float),
+        ('train.optim.lr_decay', float),
+        ('train.loss.magnitude', float),
+        ('train.loss.phase', float),
+        ('train.loss.complex', float),
+        ('train.loss.stft', float),
+        ('train.loss.metric', float),
+        ('train.loss.time', float),
+    ]:
+        parser.add_argument(f'--{name}', type=typ, default=None)
+    parser.add_argument('--data.librispeech.train_splits', nargs='+', default=None)
+    parser.add_argument('--data.librispeech.validation_splits', nargs='+', default=None)
+    parser.add_argument('--data.librispeech.noise_config_ids', nargs='+', type=int, default=None)
+    args = parser.parse_args()
+
+    if args.resume is not None:
+        print_log(f'Resuming from {args.resume}')
+        config = apply_overrides(
+            json_to_namespace(str(Path(args.resume) / 'config.json')),
+            args,
+        )
+    else:
+        config = override_json_with_args(args.config, args)
+
+    if (
+        config.data.dataset == 'librispeech'
+        and config.data.librispeech.sql_root is None
+    ):
+        from src.config import SQL_ROOT
+        config.data.librispeech.sql_root = str(SQL_ROOT)
+
+    return config, args
 
 
-def device_barrier(device, world_size):
-    if world_size > 1:
-        barrier(device_ids=[device.index])
+def prepare_run(config, args):
+    if args.checkpoint_root is not None:
+        parent = Path(args.checkpoint_root)
+    elif args.resume is not None:
+        parent = Path(args.resume).parent
+    else:
+        parent = Path(config.checkpoint_root)
 
+    run_dir = parent / datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-def configure_distributed_runtime():
-    os.environ.setdefault('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1')
-    os.environ.setdefault('NCCL_IB_DISABLE', '1')
+    if args.resume is not None:
+        resume_dir = Path(args.resume)
+        for name in ('g_latest', 'do_latest', 'g_best'):
+            src = resume_dir / name
+            if src.is_file():
+                shutil.copy2(src, run_dir / name)
+        logs_src = resume_dir / 'logs'
+        if logs_src.is_dir():
+            shutil.copytree(logs_src, run_dir / 'logs')
 
-
-def resolve_dist_timeout_minutes(h, override_minutes=None):
-    if override_minutes is not None:
-        return override_minutes
-    return h.dist_config.get('dist_timeout_minutes', DEFAULT_DIST_TIMEOUT_MINUTES)
-
-
-def setup_logging(log_dir, rank=0):
-    logger = logging.getLogger('mp_senet.train')
-    logger.handlers.clear()
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    if rank != 0:
-        logger.addHandler(logging.NullHandler())
-        return logger
-
-    os.makedirs(log_dir, exist_ok=True)
-    formatter = logging.Formatter(
-        '[%(asctime)s] %(levelname)s: %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-    )
-
-    file_handler = logging.FileHandler(os.path.join(log_dir, 'train.log'))
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    return logger
-
-
-def format_postfix(**kwargs):
-    formatted = {}
-    for key, value in kwargs.items():
-        if isinstance(value, float):
-            formatted[key] = f'{value:.3f}'
-        else:
-            formatted[key] = value
-    return formatted
-
-
-def resolve_checkpoint_path(checkpoint_root):
-    if os.path.isdir(checkpoint_root):
-        cp_g = os.path.join(checkpoint_root, 'g_latest')
-        cp_do = os.path.join(checkpoint_root, 'do_latest')
-        if os.path.isfile(cp_g) and os.path.isfile(cp_do):
-            return checkpoint_root
-        if os.path.isfile(os.path.join(checkpoint_root, 'config.json')):
-            return checkpoint_root
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    parent = checkpoint_root
-    if os.path.isfile(os.path.join(checkpoint_root, 'config.json')):
-        parent = os.path.dirname(checkpoint_root)
-    return os.path.join(parent, timestamp)
-
-
-def latest_checkpoint_paths(checkpoint_dir):
-    cp_g = os.path.join(checkpoint_dir, 'g_latest')
-    cp_do = os.path.join(checkpoint_dir, 'do_latest')
-    if os.path.isfile(cp_g) and os.path.isfile(cp_do):
-        return cp_g, cp_do
-    return None, None
-
-
-def save_latest_checkpoint(checkpoint_path, generator, discriminator, optim_g, optim_d, steps, epoch, num_gpus):
-    gen = generator.module if num_gpus > 1 else generator
-    disc = discriminator.module if num_gpus > 1 else discriminator
-    save_checkpoint(
-        os.path.join(checkpoint_path, 'g_latest'),
-        {'generator': gen.state_dict()},
-    )
-    save_checkpoint(
-        os.path.join(checkpoint_path, 'do_latest'),
-        {
-            'discriminator': disc.state_dict(),
-            'optim_g': optim_g.state_dict(),
-            'optim_d': optim_d.state_dict(),
-            'steps': steps,
-            'epoch': epoch,
-        },
-    )
-
-
-def save_best_checkpoint(checkpoint_path, generator, num_gpus):
-    gen = generator.module if num_gpus > 1 else generator
-    save_checkpoint(
-        os.path.join(checkpoint_path, 'g_best'),
-        {'generator': gen.state_dict()},
-    )
-
-
-def build_env(config, config_name, path):
-    t_path = os.path.join(path, config_name)
-    if config != t_path:
-        os.makedirs(path, exist_ok=True)
-        shutil.copyfile(config, os.path.join(path, config_name))
+    config.checkpoint_root = str(run_dir)
+    with open(run_dir / 'config.json', 'w') as f:
+        json.dump(namespace_to_dict(config), f, indent=4)
+    print_log(f'checkpoints directory: {run_dir}')
+    return config
 
 
 def mag_pha_stft(y, n_fft, hop_size, win_size, compress_factor=1.0, center=True):
@@ -167,10 +148,10 @@ def mag_pha_stft(y, n_fft, hop_size, win_size, compress_factor=1.0, center=True)
         return_complex=True,
     )
     stft_spec = torch.view_as_real(stft_spec)
-    mag = torch.sqrt(stft_spec.pow(2).sum(-1) + (1e-9))
+    mag = torch.sqrt(stft_spec.pow(2).sum(-1) + 1e-9)
     pha = torch.atan2(
-        stft_spec[:, :, :, 1] + (1e-10),
-        stft_spec[:, :, :, 0] + (1e-5),
+        stft_spec[:, :, :, 1] + 1e-10,
+        stft_spec[:, :, :, 0] + 1e-5,
     )
     mag = torch.pow(mag, compress_factor)
     com = torch.stack((mag * torch.cos(pha), mag * torch.sin(pha)), dim=-1)
@@ -178,10 +159,10 @@ def mag_pha_stft(y, n_fft, hop_size, win_size, compress_factor=1.0, center=True)
 
 
 def mag_pha_istft(mag, pha, n_fft, hop_size, win_size, compress_factor=1.0, center=True):
-    mag = torch.pow(mag, (1.0 / compress_factor))
+    mag = torch.pow(mag, 1.0 / compress_factor)
     com = torch.complex(mag * torch.cos(pha), mag * torch.sin(pha))
     hann_window = torch.hann_window(win_size).to(com.device)
-    wav = torch.istft(
+    return torch.istft(
         com,
         n_fft,
         hop_length=hop_size,
@@ -189,658 +170,366 @@ def mag_pha_istft(mag, pha, n_fft, hop_size, win_size, compress_factor=1.0, cent
         window=hann_window,
         center=center,
     )
-    return wav
 
 
-def forward_generator_batch(generator, clean_audio, noisy_audio, h):
-    clean_mag, clean_pha, clean_com = mag_pha_stft(
-        clean_audio, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
-    )
-    noisy_mag, noisy_pha, _ = mag_pha_stft(
-        noisy_audio, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
-    )
-
-    mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
-
-    audio_g = mag_pha_istft(
-        mag_g, pha_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
-    )
-    mag_g_hat, _, com_g_hat = mag_pha_stft(
-        audio_g, h.n_fft, h.hop_size, h.win_size, h.compress_factor,
-    )
-
-    return {
-        'clean_mag': clean_mag,
-        'clean_pha': clean_pha,
-        'clean_com': clean_com,
-        'noisy_mag': noisy_mag,
-        'noisy_pha': noisy_pha,
-        'mag_g': mag_g,
-        'pha_g': pha_g,
-        'com_g': com_g,
-        'audio_g': audio_g,
-        'mag_g_hat': mag_g_hat,
-        'com_g_hat': com_g_hat,
-    }
-
-
-def compute_reconstruction_errors(
-    clean_mag,
-    clean_pha,
-    clean_com,
-    mag_g,
-    pha_g,
-    com_g,
-    com_g_hat,
-    clean_audio=None,
-    audio_g=None,
-):
-    mag_error = F.mse_loss(clean_mag, mag_g).item()
-    ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g)
-    pha_error = (ip_error + gd_error + iaf_error).item()
-    com_error = F.mse_loss(clean_com, com_g).item()
-    stft_error = F.mse_loss(com_g, com_g_hat).item()
-
-    errors = {
-        'mag_error': mag_error,
-        'pha_error': pha_error,
-        'com_error': com_error,
-        'stft_error': stft_error,
-    }
-    if clean_audio is not None and audio_g is not None:
-        errors['time_error'] = F.l1_loss(clean_audio, audio_g).item()
-    return errors
-
-
-def aggregate_sum(value, device, world_size):
-    tensor = torch.tensor([value], device=device, dtype=torch.float64)
-    if world_size > 1:
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return tensor.item()
-
-
-def run_validation(
-    generator,
-    validation_loader,
-    device,
-    h,
-    *,
-    rank,
-    world_size,
-    epoch,
-    total_epochs,
-):
-    generator.eval()
-    torch.cuda.empty_cache()
-
-    val_mag_err_tot = 0.0
-    val_pha_err_tot = 0.0
-    val_com_err_tot = 0.0
-    val_stft_err_tot = 0.0
-    num_batches = 0
-    pesq_sum = 0.0
-    pesq_count = 0
-
-    val_pbar = None
-    if rank == 0:
-        val_pbar = tqdm(
-            total=len(validation_loader),
-            unit='sample',
-            desc='Validation {}/{}'.format(epoch + 1, total_epochs),
-            dynamic_ncols=True,
-            leave=False,
-        )
-
-    with torch.no_grad():
-        for batch in validation_loader:
-            clean_audio, noisy_audio = batch
-            clean_audio = clean_audio.to(device, non_blocking=True)
-            noisy_audio = noisy_audio.to(device, non_blocking=True)
-
-            outputs = forward_generator_batch(generator, clean_audio, noisy_audio, h)
-            errors = compute_reconstruction_errors(
-                outputs['clean_mag'],
-                outputs['clean_pha'],
-                outputs['clean_com'],
-                outputs['mag_g'],
-                outputs['pha_g'],
-                outputs['com_g'],
-                outputs['com_g_hat'],
-            )
-
-            for ref, est in zip(
-                torch.split(clean_audio, 1, dim=0),
-                torch.split(outputs['audio_g'], 1, dim=0),
-            ):
-                pesq_sum += cal_pesq(
-                    ref.squeeze().cpu().numpy(),
-                    est.squeeze().cpu().numpy(),
-                    h.sampling_rate,
-                )
-                pesq_count += 1
-
-            val_mag_err_tot += errors['mag_error']
-            val_pha_err_tot += errors['pha_error']
-            val_com_err_tot += errors['com_error']
-            val_stft_err_tot += errors['stft_error']
-            num_batches += 1
-
-            if val_pbar is not None:
-                val_pbar.set_postfix(
-                    format_postfix(
-                        mag=errors['mag_error'],
-                        pha=errors['pha_error'],
-                        com=errors['com_error'],
-                        stft=errors['stft_error'],
-                    ),
-                    refresh=False,
-                )
-                val_pbar.update(1)
-
-    if val_pbar is not None:
-        val_pbar.close()
-
-    total_batches = aggregate_sum(num_batches, device, world_size)
-    val_mag_err = aggregate_sum(val_mag_err_tot, device, world_size) / total_batches
-    val_pha_err = aggregate_sum(val_pha_err_tot, device, world_size) / total_batches
-    val_com_err = aggregate_sum(val_com_err_tot, device, world_size) / total_batches
-    val_stft_err = aggregate_sum(val_stft_err_tot, device, world_size) / total_batches
-
-    total_pesq_sum = aggregate_sum(pesq_sum, device, world_size)
-    total_pesq_count = aggregate_sum(pesq_count, device, world_size)
-    val_pesq_score = total_pesq_sum / total_pesq_count if total_pesq_count > 0 else 0.0
-
-    return {
-        'pesq': val_pesq_score,
-        'mag': val_mag_err,
-        'pha': val_pha_err,
-        'com': val_com_err,
-        'stft': val_stft_err,
-    }
-
-
-def train(a, h):
-    rank = h.rank
-    local_rank = h.local_rank
-    world_size = h.num_gpus
-    torch.cuda.set_device(local_rank)
-    device = torch.device('cuda:{:d}'.format(local_rank))
-
-    logger = setup_logging(a.checkpoint_path, rank=rank)
-
-    torch.cuda.manual_seed(h.seed)
-
-    generator = MPNet(h).to(device)
+def build_models(config, device):
+    optim = config.train.optim
+    generator = MPNet(config.model, config.data.stft.n_fft).to(device)
     discriminator = MetricDiscriminator().to(device)
-
-    if rank == 0:
-        logger.info(generator)
-        num_params = 0
-        for p in generator.parameters():
-            num_params += p.numel()
-        logger.info('Total Parameters: {:.3f}M'.format(num_params / 1e6))
-        os.makedirs(a.checkpoint_path, exist_ok=True)
-        os.makedirs(os.path.join(a.checkpoint_path, 'logs'), exist_ok=True)
-        logger.info('checkpoints directory: %s', a.checkpoint_path)
-
-    cp_g = None
-    cp_do = None
-    if os.path.isdir(a.checkpoint_path):
-        cp_g, cp_do = latest_checkpoint_paths(a.checkpoint_path)
-
-    steps = 0
-    if cp_g is None or cp_do is None:
-        state_dict_do = None
-        last_epoch = -1
-        if rank == 0:
-            logger.info(
-                'Starting training from scratch (g_latest/do_latest not found in %s)',
-                a.checkpoint_path,
-            )
-    else:
-        state_dict_g = load_checkpoint(cp_g, device)
-        state_dict_do = load_checkpoint(cp_do, device)
-        generator.load_state_dict(state_dict_g['generator'])
-        discriminator.load_state_dict(state_dict_do['discriminator'])
-        steps = state_dict_do['steps'] + 1
-        last_epoch = state_dict_do['epoch']
-        if rank == 0:
-            logger.info(
-                'Resuming from step %d, epoch %d',
-                state_dict_do['steps'],
-                state_dict_do['epoch'] + 1,
-            )
-
-    if world_size > 1:
-        device_barrier(device, world_size)
-
-    if world_size > 1:
-        generator = DistributedDataParallel(
-            generator,
-            device_ids=[local_rank],
-        ).to(device)
-        discriminator = DistributedDataParallel(
-            discriminator,
-            device_ids=[local_rank],
-        ).to(device)
-
     optim_g = torch.optim.AdamW(
         generator.parameters(),
-        h.learning_rate,
-        betas=[h.adam_b1, h.adam_b2],
+        optim.learning_rate,
+        betas=[optim.adam_b1, optim.adam_b2],
     )
     optim_d = torch.optim.AdamW(
         discriminator.parameters(),
-        h.learning_rate,
-        betas=[h.adam_b1, h.adam_b2],
+        optim.learning_rate,
+        betas=[optim.adam_b1, optim.adam_b2],
     )
+    return generator, discriminator, optim_g, optim_d
 
-    if state_dict_do is not None:
-        optim_g.load_state_dict(state_dict_do['optim_g'])
-        optim_d.load_state_dict(state_dict_do['optim_d'])
 
-    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-        optim_g,
-        gamma=h.lr_decay,
-        last_epoch=last_epoch,
+def forward_batch(generator, clean_audio, noisy_audio, config):
+    stft = config.data.stft
+    clean_mag, clean_pha, clean_com = mag_pha_stft(
+        clean_audio, stft.n_fft, stft.hop_size, stft.win_size, stft.compress_factor,
     )
-    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-        optim_d,
-        gamma=h.lr_decay,
-        last_epoch=last_epoch,
+    noisy_mag, noisy_pha, _ = mag_pha_stft(
+        noisy_audio, stft.n_fft, stft.hop_size, stft.win_size, stft.compress_factor,
     )
-
-    trainset, validset = build_datasets(a, h)
-    train_sampler = DistributedSampler(trainset) if world_size > 1 else None
-
-    train_loader = DataLoader(
-        trainset,
-        num_workers=h.num_workers,
-        shuffle=False,
-        sampler=train_sampler,
-        batch_size=h.batch_size,
-        pin_memory=True,
-        drop_last=True,
+    mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
+    audio_g = mag_pha_istft(
+        mag_g, pha_g, stft.n_fft, stft.hop_size, stft.win_size, stft.compress_factor,
     )
+    mag_g_hat, _, com_g_hat = mag_pha_stft(
+        audio_g, stft.n_fft, stft.hop_size, stft.win_size, stft.compress_factor,
+    )
+    loss_mag = F.mse_loss(clean_mag, mag_g)
+    loss_ip, loss_gd, loss_iaf = phase_losses(clean_pha, pha_g)
+    loss_pha = loss_ip + loss_gd + loss_iaf
+    loss_com = F.mse_loss(clean_com, com_g) * 2
+    loss_stft = F.mse_loss(com_g, com_g_hat) * 2
+    outputs = {
+        'clean_mag': clean_mag,
+        'mag_g': mag_g,
+        'mag_g_hat': mag_g_hat,
+        'audio_g': audio_g,
+    }
+    return outputs, loss_mag, loss_pha, loss_com, loss_stft
 
+
+def validate(generator, validset, device, config, rank, world_size, epoch):
+    generator.eval()
+    torch.cuda.empty_cache()
     valid_sampler = (
         DistributedSampler(validset, shuffle=False, drop_last=False)
         if world_size > 1 else None
     )
-
-    validation_loader = DataLoader(
+    loader = DataLoader(
         validset,
-        num_workers=max(1, h.num_workers // 2),
+        num_workers=max(1, config.train.env.num_workers // 2),
         shuffle=False,
         sampler=valid_sampler,
         batch_size=1,
         pin_memory=True,
         drop_last=False,
     )
+    totals = {'mag': 0.0, 'pha': 0.0, 'com': 0.0, 'stft': 0.0, 'pesq': 0.0, 'n': 0, 'pesq_n': 0}
+    pbar = None
+    if rank == 0:
+        pbar = make_progress_bar(
+            total=len(loader),
+            desc='Validation {}/{}'.format(epoch + 1, config.train.env.epochs),
+            unit='sample',
+            leave=False,
+        )
+
+    with torch.no_grad():
+        for clean_audio, noisy_audio in loader:
+            clean_audio = clean_audio.to(device, non_blocking=True)
+            noisy_audio = noisy_audio.to(device, non_blocking=True)
+            outputs, loss_mag, loss_pha, loss_com, loss_stft = forward_batch(
+                generator, clean_audio, noisy_audio, config,
+            )
+            audio_g = outputs['audio_g']
+            if audio_g.size(1) > clean_audio.size(1):
+                audio_g = audio_g[:, : clean_audio.size(1)]
+            elif audio_g.size(1) < clean_audio.size(1):
+                clean_audio = clean_audio[:, : audio_g.size(1)]
+
+            for ref, est in zip(
+                torch.split(clean_audio, 1, dim=0),
+                torch.split(audio_g, 1, dim=0),
+            ):
+                totals['pesq'] += cal_pesq(
+                    ref.squeeze().cpu().numpy(),
+                    est.squeeze().cpu().numpy(),
+                    config.data.sampling_rate,
+                )
+                totals['pesq_n'] += 1
+
+            totals['mag'] += loss_mag.item()
+            totals['pha'] += loss_pha.item()
+            totals['com'] += loss_com.item() / 2
+            totals['stft'] += loss_stft.item() / 2
+            totals['n'] += 1
+            if pbar is not None:
+                pbar.set_postfix(format_postfix(
+                    mag=loss_mag.item(),
+                    pha=loss_pha.item(),
+                    com=loss_com.item() / 2,
+                    stft=loss_stft.item() / 2,
+                ), refresh=False)
+                pbar.update(1)
+
+    if pbar is not None:
+        pbar.close()
+
+    n = aggregate_sum(totals['n'], device, world_size)
+    pesq_n = aggregate_sum(totals['pesq_n'], device, world_size)
+    return {
+        'mag': aggregate_sum(totals['mag'], device, world_size) / max(n, 1),
+        'pha': aggregate_sum(totals['pha'], device, world_size) / max(n, 1),
+        'com': aggregate_sum(totals['com'], device, world_size) / max(n, 1),
+        'stft': aggregate_sum(totals['stft'], device, world_size) / max(n, 1),
+        'pesq': aggregate_sum(totals['pesq'], device, world_size) / max(pesq_n, 1),
+    }
+
+
+def train(config):
+    rank, local_rank, world_size = resolve_dist_info()
+    device = torch.device('cuda', local_rank)
+    torch.cuda.set_device(local_rank)
+    env = config.train.env
+    batch_size = max(1, int(env.batch_size // world_size))
+    torch.random.default_generator.manual_seed(env.seed)
+    torch.cuda.manual_seed(env.seed)
+
+    steps = 0
+    last_epoch = -1
+    best_pesq = 0.0
+    do_path = Path(config.checkpoint_root) / 'do_latest'
+    g_path = Path(config.checkpoint_root) / 'g_latest'
+    state_dict_do = None
+    state_dict_g = None
+    if g_path.is_file() and do_path.is_file():
+        state_dict_g = load_checkpoint(g_path, device)
+        state_dict_do = load_checkpoint(do_path, device)
+        steps = state_dict_do['steps'] + 1
+        last_epoch = state_dict_do['epoch']
+        best_pesq = float(state_dict_do.get('best_pesq', 0.0))
+        if rank == 0:
+            print_log(
+                f"Loaded checkpoint (step {state_dict_do['steps']}, "
+                f"epoch {state_dict_do['epoch'] + 1}, best_pesq={best_pesq:.3f})",
+            )
+
+    generator, discriminator, optim_g, optim_d = build_models(config, device)
+    if state_dict_do is not None:
+        generator.load_state_dict(state_dict_g['generator'])
+        discriminator.load_state_dict(state_dict_do['discriminator'])
+        optim_g.load_state_dict(state_dict_do['optim_g'])
+        optim_d.load_state_dict(state_dict_do['optim_d'])
+
+    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
+        optim_g, gamma=config.train.optim.lr_decay, last_epoch=last_epoch,
+    )
+    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
+        optim_d, gamma=config.train.optim.lr_decay, last_epoch=last_epoch,
+    )
+
+    if world_size > 1:
+        generator = DistributedDataParallel(
+            generator, device_ids=[local_rank],
+        )
+        discriminator = DistributedDataParallel(
+            discriminator, device_ids=[local_rank],
+        )
 
     if rank == 0:
-        sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
+        n_params = sum(p.numel() for p in generator.parameters())
+        print_log(f'Total Parameters: {n_params / 1e6:.3f}M')
+        print_log(f'Batch size per GPU: {batch_size}')
+        print_log(f'world_size: {world_size}')
+        (Path(config.checkpoint_root) / 'logs').mkdir(parents=True, exist_ok=True)
+
+    trainset, validset = build_datasets(config)
+    train_sampler = DistributedSampler(trainset) if world_size > 1 else None
+    train_loader = DataLoader(
+        trainset,
+        num_workers=env.num_workers,
+        shuffle=False,
+        sampler=train_sampler,
+        batch_size=batch_size,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    sw = SummaryWriter(str(Path(config.checkpoint_root) / 'logs')) if rank == 0 else None
+    loss_w = config.train.loss
+    start_epoch = 0 if last_epoch < 0 else last_epoch + 1
+    stop = False
 
     generator.train()
     discriminator.train()
 
-    best_pesq = 0
-    epoch = last_epoch
-    start_epoch = 0 if last_epoch < 0 else last_epoch + 1
-
-    for epoch in range(start_epoch, a.training_epochs):
+    for epoch in range(start_epoch, env.epochs):
         if rank == 0:
-            start = time.time()
-            logger.info('Epoch: %d', epoch + 1)
-
+            print_log(f'Epoch: {epoch + 1}')
         if world_size > 1:
             train_sampler.set_epoch(epoch)
 
-        if rank == 0:
-            train_pbar = tqdm(
-                total=len(train_loader) * h.batch_size,
-                unit='sample',
-                desc='Epoch {}/{}'.format(epoch + 1, a.training_epochs),
-                dynamic_ncols=True,
-            )
-        else:
-            train_pbar = None
+        train_pbar = make_progress_bar(
+            total=len(train_loader) * batch_size,
+            desc='Epoch {}/{}'.format(epoch + 1, env.epochs),
+            unit='sample',
+        ) if rank == 0 else None
 
-        for batch in train_loader:
-            clean_audio, noisy_audio = batch
-
+        for clean_audio, noisy_audio in train_loader:
             clean_audio = clean_audio.to(device, non_blocking=True)
             noisy_audio = noisy_audio.to(device, non_blocking=True)
-            one_labels = torch.ones(h.batch_size).to(device, non_blocking=True)
+            one_labels = torch.ones(clean_audio.size(0), device=device)
 
-            outputs = forward_generator_batch(generator, clean_audio, noisy_audio, h)
+            outputs, loss_mag, loss_pha, loss_com, loss_stft = forward_batch(
+                generator, clean_audio, noisy_audio, config,
+            )
             clean_mag = outputs['clean_mag']
-            clean_pha = outputs['clean_pha']
-            clean_com = outputs['clean_com']
-            mag_g = outputs['mag_g']
-            pha_g = outputs['pha_g']
-            com_g = outputs['com_g']
-            audio_g = outputs['audio_g']
             mag_g_hat = outputs['mag_g_hat']
-            com_g_hat = outputs['com_g_hat']
+            audio_g = outputs['audio_g']
 
             optim_d.zero_grad()
             metric_r = discriminator(clean_mag, clean_mag)
             metric_g = discriminator(clean_mag, mag_g_hat.detach())
             loss_disc_r = F.mse_loss(one_labels, metric_r.flatten())
-            # Step-wise PESQ calculation is intentionally disabled to avoid
-            # CPU-side blocking and GPU idle time.
             loss_disc_g = 0
-
             loss_disc_all = loss_disc_r + loss_disc_g
             loss_disc_all.backward()
             optim_d.step()
 
             optim_g.zero_grad()
-
-            loss_mag = F.mse_loss(clean_mag, mag_g)
-            loss_ip, loss_gd, loss_iaf = phase_losses(clean_pha, pha_g)
-            loss_pha = loss_ip + loss_gd + loss_iaf
-            loss_com = F.mse_loss(clean_com, com_g) * 2
-            loss_stft = F.mse_loss(com_g, com_g_hat) * 2
             loss_time = F.l1_loss(clean_audio, audio_g)
             metric_g = discriminator(clean_mag, mag_g_hat)
             loss_metric = F.mse_loss(metric_g.flatten(), one_labels)
-
             loss_gen_all = (
-                loss_mag * 0.9
-                + loss_pha * 0.3
-                + loss_com * 0.1
-                + loss_stft * 0.1
-                + loss_metric * 0.05
-                + loss_time * 0.2
+                loss_mag * loss_w.magnitude
+                + loss_pha * loss_w.phase
+                + loss_com * loss_w.complex
+                + loss_stft * loss_w.stft
+                + loss_metric * loss_w.metric
+                + loss_time * loss_w.time
             )
-
             loss_gen_all.backward()
             optim_g.step()
 
             if rank == 0:
-                with torch.no_grad():
-                    metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
-                    errors = compute_reconstruction_errors(
-                        clean_mag,
-                        clean_pha,
-                        clean_com,
-                        mag_g,
-                        pha_g,
-                        com_g,
-                        com_g_hat,
-                        clean_audio=clean_audio,
-                        audio_g=audio_g,
-                    )
-                    mag_error = errors['mag_error']
-                    pha_error = errors['pha_error']
-                    com_error = errors['com_error']
-                    stft_error = errors['stft_error']
-                    time_error = errors['time_error']
-
-                if steps % a.summary_interval == 0:
-                    sw.add_scalar("Training/Generator Loss", loss_gen_all, steps)
-                    sw.add_scalar("Training/Discriminator Loss", loss_disc_all, steps)
-                    sw.add_scalar("Training/Metric Loss", metric_error, steps)
-                    sw.add_scalar("Training/Magnitude Loss", mag_error, steps)
-                    sw.add_scalar("Training/Phase Loss", pha_error, steps)
-                    sw.add_scalar("Training/Complex Loss", com_error, steps)
-                    sw.add_scalar("Training/Time Loss", time_error, steps)
-                    sw.add_scalar("Training/Consistency Loss", stft_error, steps)
-
-                train_pbar.set_postfix(
-                    format_postfix(
-                        step=steps + 1,
-                        gen=float(loss_gen_all),
-                        disc=float(loss_disc_all),
-                        metric=metric_error,
-                        mag=mag_error,
-                        pha=pha_error,
-                        com=com_error,
-                        time=time_error,
-                        stft=stft_error,
-                    ),
-                    refresh=False,
-                )
-                train_pbar.update(h.batch_size)
+                train_pbar.update(batch_size)
+                train_pbar.set_postfix(format_postfix(
+                    step=steps + 1,
+                    gen=float(loss_gen_all),
+                    disc=float(loss_disc_all),
+                    metric=float(loss_metric),
+                    mag=loss_mag.item(),
+                    pha=loss_pha.item(),
+                    com=loss_com.item() / 2,
+                    time=loss_time.item(),
+                    stft=loss_stft.item() / 2,
+                ), refresh=False)
+                if steps % env.summary_interval == 0:
+                    sw.add_scalar('Training/Generator Loss', loss_gen_all, steps)
+                    sw.add_scalar('Training/Discriminator Loss', loss_disc_all, steps)
+                    sw.add_scalar('Training/Metric Loss', loss_metric, steps)
+                    sw.add_scalar('Training/Magnitude Loss', loss_mag.item(), steps)
+                    sw.add_scalar('Training/Phase Loss', loss_pha.item(), steps)
+                    sw.add_scalar('Training/Complex Loss', loss_com.item() / 2, steps)
+                    sw.add_scalar('Training/Time Loss', loss_time.item(), steps)
+                    sw.add_scalar('Training/Consistency Loss', loss_stft.item() / 2, steps)
 
             steps += 1
+            if env.max_steps is not None and steps >= env.max_steps:
+                stop = True
+                break
 
-        if rank == 0:
+        if rank == 0 and train_pbar is not None:
             train_pbar.close()
 
-        val_metrics = run_validation(
-            generator,
-            validation_loader,
-            device,
-            h,
-            rank=rank,
-            world_size=world_size,
-            epoch=epoch,
-            total_epochs=a.training_epochs,
-        )
+        if stop:
+            if rank == 0:
+                save_latest_checkpoint(
+                    config.checkpoint_root,
+                    generator, discriminator, optim_g, optim_d,
+                    steps, epoch - 1, best_pesq, world_size,
+                )
+                print_log(f'Stopped at max_steps={env.max_steps} (step {steps})')
+            break
 
+        val_metrics = validate(
+            generator, validset, device, config, rank, world_size, epoch,
+        )
         if rank == 0:
-            val_message = (
+            msg = (
                 'Validation (epoch {}/{}): PESQ={:.3f}, mag={:.3f}, '
                 'pha={:.3f}, com={:.3f}, stft={:.3f}'
             ).format(
-                epoch + 1,
-                a.training_epochs,
-                val_metrics['pesq'],
-                val_metrics['mag'],
-                val_metrics['pha'],
-                val_metrics['com'],
-                val_metrics['stft'],
+                epoch + 1, env.epochs,
+                val_metrics['pesq'], val_metrics['mag'], val_metrics['pha'],
+                val_metrics['com'], val_metrics['stft'],
             )
-            tqdm.write(val_message)
-            logger.info(val_message)
-
+            tqdm.write(msg)
+            print_log(msg)
             sw.add_scalar('Validation/PESQ Score', val_metrics['pesq'], epoch + 1)
             sw.add_scalar('Validation/Magnitude Loss', val_metrics['mag'], epoch + 1)
             sw.add_scalar('Validation/Phase Loss', val_metrics['pha'], epoch + 1)
             sw.add_scalar('Validation/Complex Loss', val_metrics['com'], epoch + 1)
             sw.add_scalar('Validation/Consistency Loss', val_metrics['stft'], epoch + 1)
-
             if val_metrics['pesq'] > best_pesq:
                 best_pesq = val_metrics['pesq']
-                save_best_checkpoint(
-                    a.checkpoint_path,
-                    generator,
-                    h.num_gpus,
+                save_best_checkpoint(config.checkpoint_root, generator, world_size)
+                print_log(
+                    f'Updated best checkpoint (PESQ={best_pesq:.3f}) at epoch {epoch + 1}',
                 )
-                best_message = (
-                    'Updated best checkpoint (PESQ={:.3f}) at epoch {}'
-                ).format(best_pesq, epoch + 1)
-                tqdm.write(best_message)
-                logger.info(best_message)
-
             save_latest_checkpoint(
-                a.checkpoint_path,
-                generator,
-                discriminator,
-                optim_g,
-                optim_d,
-                steps,
-                epoch,
-                h.num_gpus,
+                config.checkpoint_root,
+                generator, discriminator, optim_g, optim_d,
+                steps, epoch, best_pesq, world_size,
             )
-            checkpoint_message = (
-                'Saved latest checkpoint at end of epoch {} (step {})'
-            ).format(epoch + 1, steps)
-            tqdm.write(checkpoint_message)
-            logger.info(checkpoint_message)
+            print_log(f'Saved latest checkpoint at end of epoch {epoch + 1} (step {steps})')
 
         generator.train()
-
         if world_size > 1:
-            device_barrier(device, world_size)
-
+            dist.barrier()
         scheduler_g.step()
         scheduler_d.step()
 
-        if rank == 0:
-            epoch_time = int(time.time() - start)
-            logger.info(
-                'Time taken for epoch %d is %d sec',
-                epoch + 1,
-                epoch_time,
-            )
-
+    if sw is not None:
+        sw.close()
     if world_size > 1:
         destroy_process_group()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        '--dataset',
-        default='voicebank',
-        choices=['voicebank', 'librispeech'],
-        help='Dataset backend used by build_datasets().',
-    )
-    parser.add_argument(
-        '--input_clean_wavs_dir',
-        default='data/raw/VoiceBank+DEMAND/clean_trainset_56spk_wav',
-    )
-    parser.add_argument(
-        '--input_noisy_wavs_dir',
-        default='data/raw/VoiceBank+DEMAND/noisy_trainset_56spk_wav',
-    )
-    parser.add_argument(
-        '--input_validation_clean_wavs_dir',
-        default='data/raw/VoiceBank+DEMAND/clean_testset_wav',
-    )
-    parser.add_argument(
-        '--input_validation_noisy_wavs_dir',
-        default='data/raw/VoiceBank+DEMAND/noisy_testset_wav',
-    )
-    parser.add_argument(
-        '--input_training_file',
-        default='data/raw/VoiceBank+DEMAND/log_trainset_56spk.txt',
-    )
-    parser.add_argument(
-        '--input_validation_file',
-        default='data/raw/VoiceBank+DEMAND/log_testset.txt',
-    )
-    parser.add_argument(
-        '--train_splits',
-        default=None,
-        nargs='+',
-        help='LibriSpeech utterance splits used for training (required for librispeech).',
-    )
-    parser.add_argument(
-        '--validation_splits',
-        default=None,
-        nargs='+',
-        help='LibriSpeech utterance splits used for validation (required for librispeech).',
-    )
-    parser.add_argument(
-        '--noise_config_ids',
-        default=None,
-        nargs='+',
-        type=int,
-        help='noise_configs.id values for on-the-fly mixing (default: all non-clean).',
-    )
-    parser.add_argument('--checkpoint_path', default=CHECKPOINT_ROOT)
-    parser.add_argument('--config', default='src/mp_senet/configs/conformer.json')
-    parser.add_argument('--training_epochs', default=400, type=int)
-    parser.add_argument('--summary_interval', default=100, type=int)
-    parser.add_argument(
-        '--num_workers',
-        default=None,
-        type=int,
-        help='Override config num_workers for DataLoader.',
-    )
-    parser.add_argument(
-        '--dist_timeout_minutes',
-        default=None,
-        type=int,
-        help=(
-            'NCCL/process-group timeout in minutes for barrier and collective ops. '
-            'Increase when running multiple jobs on one host.'
-        ),
-    )
-
-    a = parser.parse_args()
-    if a.dataset == 'librispeech':
-        from src.config import SQL_ROOT
-        a.sql_root = str(SQL_ROOT)
-        if not a.train_splits:
-            parser.error('--train_splits is required for --dataset librispeech')
-        if not a.validation_splits:
-            parser.error('--validation_splits is required for --dataset librispeech')
-
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA is required for training.')
-
-    rank = int(os.environ.get('RANK', 0))
-    local_rank = (
-        0
-        if os.environ.get('MP_SENET_ISOLATED_DEVICE') == '1'
-        else int(os.environ.get('LOCAL_RANK', 0))
-    )
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    configure_runtime()
+    rank, local_rank, world_size = resolve_dist_info()
     torch.cuda.set_device(local_rank)
 
-    with open(a.config) as f:
-        data = f.read()
-
-    json_config = json.loads(data)
-    h = AttrDict(json_config)
-    if a.num_workers is not None:
-        h.num_workers = a.num_workers
-    h.rank = rank
-    h.local_rank = local_rank
-    h.num_gpus = world_size
-    h.dist_init_method = 'env://'
-    h.dist_timeout_minutes = resolve_dist_timeout_minutes(
-        h,
-        override_minutes=a.dist_timeout_minutes,
-    )
-    h.batch_size = int(h.batch_size / h.num_gpus)
-
-    if h.num_gpus > 1:
-        configure_distributed_runtime()
+    if world_size > 1:
         init_process_group(
-            backend=h.dist_config['dist_backend'],
-            timeout=timedelta(minutes=h.dist_timeout_minutes),
+            backend='nccl',
+            timeout=timedelta(minutes=120),
             device_id=torch.device('cuda', local_rank),
         )
 
+    config, args = parse_args()
     if rank == 0:
-        checkpoint_path = resolve_checkpoint_path(a.checkpoint_path)
-        os.makedirs(checkpoint_path, exist_ok=True)
-        objects = [checkpoint_path]
+        config = prepare_run(config, args)
+        objects = [config.checkpoint_root]
     else:
         objects = [None]
-    if h.num_gpus > 1:
+    if world_size > 1:
         dist.broadcast_object_list(objects, src=0)
-    a.checkpoint_path = objects[0]
-
-    if rank == 0:
-        build_env(a.config, 'config.json', a.checkpoint_path)
-        logger = setup_logging(a.checkpoint_path, rank=0)
-        tqdm.write('Initializing Training Process..')
-        tqdm.write('checkpoints directory: {}'.format(a.checkpoint_path))
-        logger.info('Initializing Training Process..')
-        logger.info('checkpoints directory: %s', a.checkpoint_path)
-        tqdm.write('Batch size per GPU: {}'.format(h.batch_size))
-        tqdm.write('num_workers: {}'.format(h.num_workers))
-        logger.info('Batch size per GPU: %d', h.batch_size)
-        logger.info('num_workers: %d', h.num_workers)
-
-    if h.num_gpus > 1 and rank == 0:
-        tqdm.write('dist_init_method: {}'.format(h.dist_init_method))
-        tqdm.write('dist_timeout_minutes: {}'.format(h.dist_timeout_minutes))
-        logger.info('dist_init_method: %s', h.dist_init_method)
-        logger.info('dist_timeout_minutes: %d', h.dist_timeout_minutes)
-
-    torch.random.default_generator.manual_seed(h.seed)
-    torch.cuda.manual_seed(h.seed)
-    train(a, h)
+    config.checkpoint_root = objects[0]
+    train(config)
 
 
 if __name__ == '__main__':
