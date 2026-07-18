@@ -152,13 +152,12 @@ class MagDecoder(nn.Module):
     """
     MagDecoder module for decoding magnitude information.
     """
-    def __init__(self, cfg):
+    def __init__(self, cfg, n_fft):
         super(MagDecoder, self).__init__()
         self.dense_block = DenseBlock(cfg, depth=4)
         self.hid_feature = cfg.hid_feature
         self.output_channel = cfg.output_channel
-        self.n_fft = cfg.n_fft
-        #self.beta = cfg.beta
+        self.n_fft = n_fft
 
         self.mask_conv = nn.Sequential(
             nn.ConvTranspose2d(self.hid_feature, self.hid_feature, (1, 3), stride=(1, 2)),

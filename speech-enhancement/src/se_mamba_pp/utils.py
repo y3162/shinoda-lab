@@ -1,29 +1,72 @@
-import logging
+import argparse
+import json
 import os
-import shutil
 import sys
-from datetime import datetime
+from pathlib import Path
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from pesq import pesq
-from torch.distributed import barrier
 from tqdm import tqdm
 
 
-DEFAULT_DIST_TIMEOUT_MINUTES = 120
+def override_json_with_args(json_path, args):
+    with open(json_path, 'r') as f:
+        config = json.load(f)
+    return __json_to_namespace(__override_config(config, args))
 
 
-class AttrDict(dict):
-    def __init__(self, *args, **kwargs):
-        super(AttrDict, self).__init__(*args, **kwargs)
-        self.__dict__ = self
+def json_to_namespace(json_path):
+    with open(json_path, 'r') as f:
+        return __json_to_namespace(json.load(f))
+
+
+def namespace_to_dict(value):
+    if isinstance(value, argparse.Namespace):
+        return {key: namespace_to_dict(val) for key, val in vars(value).items()}
+    if isinstance(value, list):
+        return [namespace_to_dict(item) for item in value]
+    if isinstance(value, dict):
+        return {key: namespace_to_dict(val) for key, val in value.items()}
+    return value
+
+
+def apply_overrides(config, args):
+    return __json_to_namespace(
+        __override_config(namespace_to_dict(config), args),
+    )
+
+
+def __json_to_namespace(value):
+    if isinstance(value, dict):
+        return argparse.Namespace(**{
+            key: __json_to_namespace(val) for key, val in value.items()
+        })
+    if isinstance(value, list):
+        return [__json_to_namespace(item) for item in value]
+    return value
+
+
+def __override_config(config, args):
+    for dotted_key, value in vars(args).items():
+        if value is None or dotted_key in {
+            'config', 'resume', 'checkpoint_root',
+        }:
+            continue
+        keys = dotted_key.split('.')
+        target = config
+        for key in keys[:-1]:
+            if key not in target:
+                raise KeyError(f'Unknown config key: {dotted_key}')
+            target = target[key]
+        if keys[-1] not in target:
+            raise KeyError(f'Unknown config key: {dotted_key}')
+        target[keys[-1]] = value
+    return config
 
 
 def load_checkpoint(filepath, device):
-    assert os.path.isfile(filepath)
-    return torch.load(filepath, map_location=device)
+    return torch.load(filepath, map_location=device, weights_only=False)
 
 
 def save_checkpoint(filepath, obj):
@@ -32,26 +75,9 @@ def save_checkpoint(filepath, obj):
 
 def cal_pesq(clean, noisy, sr=16000):
     try:
-        score = pesq(sr, clean, noisy, 'wb')
+        return pesq(sr, clean, noisy, 'wb')
     except Exception:
-        score = -1
-    return score
-
-
-def batch_pesq(clean, noisy):
-    scores = np.array([
-        cal_pesq(clean_utt, noisy_utt)
-        for clean_utt, noisy_utt in zip(clean, noisy)
-    ])
-    if -1 in scores:
-        return None
-    scores = (scores - 1) / 3.5
-    return torch.FloatTensor(scores)
-
-
-def device_barrier(device, world_size):
-    if world_size > 1:
-        barrier(device_ids=[device.index])
+        return -1
 
 
 def configure_runtime():
@@ -77,50 +103,23 @@ def worker_init_fn(_worker_id):
 
 def resolve_dist_info():
     rank = int(os.environ.get('RANK', 0))
-    local_rank = (
-        0
-        if os.environ.get('SE_MAMBA_ISOLATED_DEVICE') == '1'
-        else int(os.environ.get('LOCAL_RANK', 0))
-    )
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     return rank, local_rank, world_size
 
 
-def resolve_dist_timeout_minutes(h, override_minutes=None):
-    if override_minutes is not None:
-        return override_minutes
-    return h.dist_config.get('dist_timeout_minutes', DEFAULT_DIST_TIMEOUT_MINUTES)
-
-
-def setup_logging(log_dir, rank=0):
-    logger = logging.getLogger('se_mamba_pp.train')
-    logger.handlers.clear()
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    if rank != 0:
-        logger.addHandler(logging.NullHandler())
-        return logger
-
-    os.makedirs(log_dir, exist_ok=True)
-    formatter = logging.Formatter(
-        '[%(asctime)s] %(levelname)s: %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-    )
-    file_handler = logging.FileHandler(os.path.join(log_dir, 'train.log'))
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    return logger
+def aggregate_sum(value, device, world_size):
+    tensor = torch.tensor([value], device=device, dtype=torch.float64)
+    if world_size > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor.item()
 
 
 def format_postfix(**kwargs):
-    formatted = {}
-    for key, value in kwargs.items():
-        if isinstance(value, float):
-            formatted[key] = f'{value:.3f}'
-        else:
-            formatted[key] = value
-    return formatted
+    return {
+        key: f'{value:.3f}' if isinstance(value, float) else value
+        for key, value in kwargs.items()
+    }
 
 
 class TorchrunTqdm(tqdm):
@@ -143,40 +142,15 @@ class TorchrunTqdm(tqdm):
 
 
 def make_progress_bar(total, desc, unit='sample', leave=True):
-    return TorchrunTqdm(
-        total=total,
-        desc=desc,
-        unit=unit,
-        leave=leave,
-    )
+    return TorchrunTqdm(total=total, desc=desc, unit=unit, leave=leave)
 
 
-def resolve_checkpoint_path(checkpoint_root):
-    if os.path.isdir(checkpoint_root):
-        cp_g = os.path.join(checkpoint_root, 'g_latest')
-        cp_do = os.path.join(checkpoint_root, 'do_latest')
-        if os.path.isfile(cp_g) and os.path.isfile(cp_do):
-            return checkpoint_root
-        if os.path.isfile(os.path.join(checkpoint_root, 'config.json')):
-            return checkpoint_root
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    parent = checkpoint_root
-    if os.path.isfile(os.path.join(checkpoint_root, 'config.json')):
-        parent = os.path.dirname(checkpoint_root)
-    return os.path.join(parent, timestamp)
-
-
-def latest_checkpoint_paths(checkpoint_dir):
-    cp_g = os.path.join(checkpoint_dir, 'g_latest')
-    cp_do = os.path.join(checkpoint_dir, 'do_latest')
-    if os.path.isfile(cp_g) and os.path.isfile(cp_do):
-        return cp_g, cp_do
-    return None, None
+def unwrap(model, world_size):
+    return model.module if world_size > 1 else model
 
 
 def save_latest_checkpoint(
-    checkpoint_path,
+    run_dir,
     generator,
     mssbcqtd,
     mrd,
@@ -184,45 +158,30 @@ def save_latest_checkpoint(
     optim_d,
     steps,
     epoch,
-    num_gpus,
+    best_pesq,
+    world_size,
 ):
-    gen = generator.module if num_gpus > 1 else generator
-    disc_q = mssbcqtd.module if num_gpus > 1 else mssbcqtd
-    disc_r = mrd.module if num_gpus > 1 else mrd
+    run_dir = Path(run_dir)
     save_checkpoint(
-        os.path.join(checkpoint_path, 'g_latest'),
-        {'generator': gen.state_dict()},
+        run_dir / 'g_latest',
+        {'generator': unwrap(generator, world_size).state_dict()},
     )
     save_checkpoint(
-        os.path.join(checkpoint_path, 'do_latest'),
+        run_dir / 'do_latest',
         {
-            'mssbcqtd': disc_q.state_dict(),
-            'mrd': disc_r.state_dict(),
+            'mssbcqtd': unwrap(mssbcqtd, world_size).state_dict(),
+            'mrd': unwrap(mrd, world_size).state_dict(),
             'optim_g': optim_g.state_dict(),
             'optim_d': optim_d.state_dict(),
             'steps': steps,
             'epoch': epoch,
+            'best_pesq': best_pesq,
         },
     )
 
 
-def save_best_checkpoint(checkpoint_path, generator, num_gpus):
-    gen = generator.module if num_gpus > 1 else generator
+def save_best_checkpoint(run_dir, generator, world_size):
     save_checkpoint(
-        os.path.join(checkpoint_path, 'g_best'),
-        {'generator': gen.state_dict()},
+        Path(run_dir) / 'g_best',
+        {'generator': unwrap(generator, world_size).state_dict()},
     )
-
-
-def build_env(config, config_name, path):
-    target_path = os.path.join(path, config_name)
-    if config != target_path:
-        os.makedirs(path, exist_ok=True)
-        shutil.copyfile(config, target_path)
-
-
-def aggregate_sum(value, device, world_size):
-    tensor = torch.tensor([value], device=device, dtype=torch.float64)
-    if world_size > 1:
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return tensor.item()

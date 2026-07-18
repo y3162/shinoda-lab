@@ -14,20 +14,8 @@ from scipy import signal
 import math
 
 
-def phase_losses(phase_r, phase_g, cfg):
-    """
-    Calculate phase losses including in-phase loss, gradient delay loss, 
-    and integrated absolute frequency loss between reference and generated phases.
-    
-    Args:
-        phase_r (torch.Tensor): Reference phase tensor of shape (batch, freq, time).
-        phase_g (torch.Tensor): Generated phase tensor of shape (batch, freq, time).
-        h (object): Configuration object containing parameters like n_fft.
-    
-    Returns:
-        tuple: Tuple containing in-phase loss, gradient delay loss, and integrated absolute frequency loss.
-    """
-    dim_freq = cfg.n_fft // 2 + 1  # Calculate frequency dimension
+def phase_losses(phase_r, phase_g, stft):
+    dim_freq = stft.n_fft // 2 + 1
     dim_time = phase_r.size(-1)  # Calculate time dimension
     
     # Construct gradient delay matrix

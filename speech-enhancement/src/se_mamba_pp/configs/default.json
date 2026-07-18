@@ -1,42 +1,67 @@
 {
-    "batch_size": 8,
-    "learning_rate": 0.0002,
-    "adam_b1": 0.8,
-    "adam_b2": 0.99,
-    "lr_decay": 0.99,
-    "seed": 1234,
-    "num_workers": 8,
-    "prefetch_factor": 2,
-    "segment_size": 48000,
-
-    "sampling_rate": 16000,
-    "n_fft": 400,
-    "hop_size": 100,
-    "win_size": 400,
-    "compress_factor": 0.3,
-
-    "hid_feature": 48,
-    "unet_expansion": 1,
-    "num_tfmamba": 4,
-    "d_state": 16,
-    "d_conv": 4,
-    "expand": 2,
-    "norm_epsilon": 0.00001,
-    "beta": 2.0,
-    "input_channel": 2,
-    "output_channel": 1,
-    "dropout": 0.1,
-
-    "loss_adv_g": 1.0,
-    "loss_fm_g": 1.0,
-    "loss_magnitude": 0.9,
-    "loss_phase": 0.3,
-    "loss_complex": 0.1,
-    "loss_mel": 0.1,
-    "loss_consistancy": 0.1,
-
-    "dist_config": {
-        "dist_backend": "nccl",
-        "world_size": 1
+    "checkpoint_root": "data/checkpoints/se_mamba_pp",
+    "data": {
+        "dataset": "voicebank",
+        "sampling_rate": 16000,
+        "segment_size": 48000,
+        "stft": {
+            "n_fft": 400,
+            "hop_size": 100,
+            "win_size": 400,
+            "compress_factor": 0.3
+        },
+        "voicebank": {
+            "clean_train_dir": "data/raw/VoiceBank+DEMAND/clean_trainset_56spk_wav",
+            "noisy_train_dir": "data/raw/VoiceBank+DEMAND/noisy_trainset_56spk_wav",
+            "clean_valid_dir": "data/raw/VoiceBank+DEMAND/clean_testset_wav",
+            "noisy_valid_dir": "data/raw/VoiceBank+DEMAND/noisy_testset_wav",
+            "train_file": "data/raw/VoiceBank+DEMAND/log_trainset_56spk.txt",
+            "valid_file": "data/raw/VoiceBank+DEMAND/log_testset.txt"
+        },
+        "librispeech": {
+            "sql_root": null,
+            "train_splits": null,
+            "validation_splits": null,
+            "noise_config_ids": null
+        }
+    },
+    "model": {
+        "hid_feature": 48,
+        "unet_expansion": 1,
+        "num_tfmamba": 4,
+        "d_state": 16,
+        "d_conv": 4,
+        "expand": 2,
+        "norm_epsilon": 0.00001,
+        "beta": 2.0,
+        "input_channel": 2,
+        "output_channel": 1,
+        "dropout": 0.1
+    },
+    "train": {
+        "env": {
+            "batch_size": 8,
+            "seed": 42,
+            "num_workers": 8,
+            "prefetch_factor": 2,
+            "epochs": 100,
+            "summary_interval": 100,
+            "max_steps": null
+        },
+        "optim": {
+            "learning_rate": 0.0002,
+            "adam_b1": 0.8,
+            "adam_b2": 0.99,
+            "lr_decay": 0.99
+        },
+        "loss": {
+            "adv_g": 1.0,
+            "fm_g": 1.0,
+            "magnitude": 0.9,
+            "phase": 0.3,
+            "complex": 0.1,
+            "mel": 0.1,
+            "consistancy": 0.1
+        }
     }
 }

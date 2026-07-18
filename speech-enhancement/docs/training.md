@@ -38,24 +38,44 @@ python -m src.mp_senet.train \
 
 ## Train *SEMamba++* (VoiceBank+DEMAND)
 
+Defaults are loaded from `src/se_mamba_pp/configs/default.json`.
+Nested keys can be overridden with dotted CLI flags (for example `--train.env.batch_size 4`).
+
 ```bash
 python -m src.se_mamba_pp.train \
     --config src/se_mamba_pp/configs/default.json
 ```
 
-Checkpoints are written under `data/checkpoints/se_mamba_pp/<YYYYMMDD_HHMMSS>/`.
+Checkpoints, `config.json`, and TensorBoard logs are written under
+`data/checkpoints/se_mamba_pp/<YYYYMMDD_HHMMSS>/`.
+Stdout progress uses `print_log` and tqdm; TensorBoard is under `<run>/logs/`.
 
----
+Optional: `--train.env.max_steps N` stops after `N` optimizer steps (useful for smoke tests).
 
-## Train *SEMamba++* (LibriSpeech)
+### Resume
+
+Resume creates a **new** run directory (non-destructive), copies
+`g_latest` / `do_latest` / `g_best` / `logs/` from the previous run, and continues.
+CLI overrides are allowed.
 
 ```bash
 python -m src.se_mamba_pp.train \
-    --dataset librispeech \
-    --config src/se_mamba_pp/configs/default.json \
-    --train_splits train-clean-360 \
-    --validation_splits dev-clean
+    --resume data/checkpoints/se_mamba_pp/<YYYYMMDD_HHMMSS>
 ```
+
+### LibriSpeech
+
+Set dataset and splits via config or CLI:
+
+```bash
+python -m src.se_mamba_pp.train \
+    --config src/se_mamba_pp/configs/default.json \
+    --data.dataset librispeech \
+    --data.librispeech.train_splits train-clean-360 \
+    --data.librispeech.validation_splits dev-clean
+```
+
+If `data.librispeech.sql_root` is null, `SQL_ROOT` from `src.config` is used.
 
 ---
 

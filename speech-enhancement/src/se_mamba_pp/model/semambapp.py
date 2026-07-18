@@ -258,26 +258,14 @@ class SEMambapp(nn.Module):
     This model uses a dense encoder, multiple Mamba blocks, and separate magnitude
     and phase decoders to process noisy magnitude and phase inputs.
     """
-    def __init__(self, cfg):
-        """
-        Initialize the SEMamba model.
-        
-        Args:
-        - cfg: Configuration object containing model parameters.
-        """
+    def __init__(self, cfg, n_fft):
         super(SEMambapp, self).__init__()
         self.cfg = cfg
-        self.num_tscblocks = cfg.num_tfmamba if cfg.num_tfmamba is not None else 4  # default tfmamba: 4
+        self.num_tscblocks = cfg.num_tfmamba if cfg.num_tfmamba is not None else 4
 
-        # Initialize dense encoder
         self.dense_encoder = DenseEncoder(cfg)
-        
-        # Initialize Mamba blocks
-        self.TSMamba = nn.ModuleList([SEMambapp_bottleneck(cfg) for _ in range(self.num_tscblocks)]) 
-        #self.FAN = nn.ModuleList([FANFFN(cfg['model_cfg']['stft_hid_feature'], 2) for _ in range(self.num_tscblocks-2)])
-        #self.TSMamba_loc = nn.ModuleList([TFMambaBlock(cfg, single=True) for _ in range(self.num_tscblocks//2)])
-        # Initialize decoders
-        self.mask_decoder = MagDecoder(cfg)
+        self.TSMamba = nn.ModuleList([SEMambapp_bottleneck(cfg) for _ in range(self.num_tscblocks)])
+        self.mask_decoder = MagDecoder(cfg, n_fft)
         self.phase_decoder = PhaseDecoder(cfg)
 
     def forward(self, noisy_mag, noisy_pha):
