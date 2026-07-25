@@ -39,13 +39,13 @@ uv pip install \
     --extra-index-url https://pypi.org/simple
 ```
 
-### SEMamba++
+### SEMamba / SEMamba++
 
 #### Environment Activation
 
 ```bash
-uv venv ./.venv/se_mamba_pp_env --python 3.10
-source ./.venv/se_mamba_pp_env/bin/activate
+uv venv ./.venv/se_mamba_env --python 3.10
+source ./.venv/se_mamba_env/bin/activate
 ```
 
 #### Install Dependencies

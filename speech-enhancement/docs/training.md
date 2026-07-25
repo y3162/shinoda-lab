@@ -96,13 +96,56 @@ If `data.librispeech.sql_root` is null, `SQL_ROOT` from `src.config` is used.
 
 ---
 
+## Train *SEMamba* (advanced, VoiceBank+DEMAND)
+
+Activate `se_mamba_pp_env` (shared with SEMamba++). Defaults are in `src/se_mamba/configs/advanced.json`.
+PCS training target: `src/se_mamba/configs/advanced_pcs.json` (`train.use_pcs400=true`).
+
+```bash
+source .venv/se_mamba_pp_env/bin/activate
+source commands/export.sh
+
+torchrun --standalone --nproc_per_node=1 -m src.se_mamba.train \
+    --config src/se_mamba/configs/advanced.json
+```
+
+Checkpoints under `data/checkpoints/se_mamba/<YYYYMMDD_HHMMSS>/`.
+Uses synchronous sequential `batch_pesq` for the MetricDiscriminator (same loss form as upstream SEMamba).
+
+### Resume
+
+```bash
+torchrun --standalone --nproc_per_node=1 -m src.se_mamba.train \
+    --resume data/checkpoints/se_mamba/<YYYYMMDD_HHMMSS>
+```
+
+### Inference
+
+```bash
+python -m src.se_mamba.infer \
+    --checkpoint data/checkpoints/se_mamba/<YYYYMMDD_HHMMSS> \
+    --input_folder path/to/noisy_wavs \
+    --output_folder path/to/enhanced \
+    --post_processing_pcs false
+```
+
+`--checkpoint` may be a run directory (`g_best` preferred, else `g_latest`) or a checkpoint file.
+Omit `--config` to load `<run>/config.json`.
+
+---
+
 ## Multi-GPU
 
-Both trainers support DDP via `torchrun`.
+Trainers support DDP via `torchrun`.
 
 ```bash
 torchrun --nproc_per_node=2 -m src.mp_senet.train \
     --config src/mp_senet/configs/conformer.json
+```
+
+```bash
+torchrun --nproc_per_node=2 -m src.se_mamba.train \
+    --config src/se_mamba/configs/advanced.json
 ```
 
 ```bash
