@@ -34,6 +34,7 @@ uv pip install \
     joblib \
     natsort \
     pesq \
+    pystoi \
     --index-url https://download.pytorch.org/whl/cu124 \
     --extra-index-url https://pypi.org/simple
 ```
@@ -79,6 +80,7 @@ uv pip install \
     wandb \
     tensorboard \
     pesq==0.0.4 \
+    pystoi \
     evaluate \
     jiwer \
     num2words \
