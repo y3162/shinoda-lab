@@ -19,6 +19,7 @@ from src.mp_senet.model.model import MPNet, phase_losses
 from src.mp_senet.utils import (
     aggregate_sum,
     apply_overrides,
+    batch_pesq,
     cal_pesq,
     configure_runtime,
     format_postfix,
@@ -30,6 +31,7 @@ from src.mp_senet.utils import (
     resolve_dist_info,
     save_best_checkpoint,
     save_latest_checkpoint,
+    worker_init_fn,
 )
 from src.utils.print import print_log
 
@@ -67,6 +69,7 @@ def parse_args():
         ('train.env.batch_size', int),
         ('train.env.seed', int),
         ('train.env.num_workers', int),
+        ('train.env.prefetch_factor', int),
         ('train.env.epochs', int),
         ('train.env.summary_interval', int),
         ('train.env.max_steps', int),
@@ -227,7 +230,7 @@ def validate(generator, validset, device, config, rank, world_size, epoch):
     )
     loader = DataLoader(
         validset,
-        num_workers=max(1, config.train.env.num_workers // 2),
+        num_workers=0,
         shuffle=False,
         sampler=valid_sampler,
         batch_size=1,
@@ -355,14 +358,20 @@ def train(config):
 
     trainset, validset = build_datasets(config)
     train_sampler = DistributedSampler(trainset) if world_size > 1 else None
+    loader_kwargs = {}
+    if env.num_workers > 0:
+        loader_kwargs['persistent_workers'] = True
+        loader_kwargs['prefetch_factor'] = env.prefetch_factor
+        loader_kwargs['worker_init_fn'] = worker_init_fn
     train_loader = DataLoader(
         trainset,
         num_workers=env.num_workers,
-        shuffle=False,
+        shuffle=(train_sampler is None),
         sampler=train_sampler,
         batch_size=batch_size,
         pin_memory=True,
         drop_last=True,
+        **loader_kwargs,
     )
 
     sw = SummaryWriter(str(Path(config.checkpoint_root) / 'logs')) if rank == 0 else None
@@ -397,11 +406,20 @@ def train(config):
             mag_g_hat = outputs['mag_g_hat']
             audio_g = outputs['audio_g']
 
+            audio_list_r = list(clean_audio.cpu().numpy())
+            audio_list_g = list(audio_g.detach().cpu().numpy())
+            batch_pesq_score = batch_pesq(audio_list_r, audio_list_g)
+
             optim_d.zero_grad()
             metric_r = discriminator(clean_mag, clean_mag)
             metric_g = discriminator(clean_mag, mag_g_hat.detach())
             loss_disc_r = F.mse_loss(one_labels, metric_r.flatten())
-            loss_disc_g = 0
+            if batch_pesq_score is not None:
+                loss_disc_g = F.mse_loss(
+                    batch_pesq_score.to(device), metric_g.flatten(),
+                )
+            else:
+                loss_disc_g = 0
             loss_disc_all = loss_disc_r + loss_disc_g
             loss_disc_all.backward()
             optim_d.step()

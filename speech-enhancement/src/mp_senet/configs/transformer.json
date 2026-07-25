@@ -37,6 +37,7 @@
             "batch_size": 16,
             "seed": 42,
             "num_workers": 4,
+            "prefetch_factor": 2,
             "epochs": 400,
             "summary_interval": 100,
             "max_steps": null

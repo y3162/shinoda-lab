@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -103,6 +104,14 @@ def cal_pesq(clean, noisy, sr=16000):
         return -1
 
 
+def batch_pesq(clean, noisy):
+    pesq_score = np.array([cal_pesq(c, n) for c, n in zip(clean, noisy)])
+    if -1 in pesq_score:
+        return None
+    pesq_score = (pesq_score - 1) / 3.5
+    return torch.FloatTensor(pesq_score)
+
+
 def configure_runtime():
     os.environ.setdefault('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1')
     os.environ.setdefault('NCCL_IB_DISABLE', '1')
@@ -116,6 +125,12 @@ def configure_runtime():
         torch.set_num_interop_threads(1)
     except RuntimeError:
         pass
+
+
+def worker_init_fn(_worker_id):
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    torch.set_num_threads(1)
 
 
 def resolve_dist_info():
