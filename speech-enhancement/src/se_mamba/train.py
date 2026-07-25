@@ -1,8 +1,25 @@
 import argparse
 import json
+import os
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
+
+
+def _isolate_cuda_visible_device():
+    if 'LOCAL_RANK' not in os.environ:
+        return False
+    local_rank = int(os.environ['LOCAL_RANK'])
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible:
+        devices = [d.strip() for d in visible.split(',') if d.strip()]
+        os.environ['CUDA_VISIBLE_DEVICES'] = devices[local_rank]
+    else:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank)
+    return True
+
+
+_CUDA_ISOLATED = _isolate_cuda_visible_device()
 
 import torch
 import torch.distributed as dist
@@ -38,6 +55,10 @@ from src.se_mamba.utils import (
 from src.utils.print import print_log
 
 torch.backends.cudnn.benchmark = True
+
+
+def _device_index(local_rank):
+    return 0 if _CUDA_ISOLATED else local_rank
 
 
 def _str2bool(value):
@@ -279,8 +300,9 @@ def validate(generator, validset, device, config, rank, world_size, epoch):
 
 def train(config):
     rank, local_rank, world_size = resolve_dist_info()
-    device = torch.device('cuda', local_rank)
-    torch.cuda.set_device(local_rank)
+    device_index = _device_index(local_rank)
+    device = torch.device('cuda', device_index)
+    torch.cuda.set_device(device_index)
     env = config.train.env
     batch_size = max(1, int(env.batch_size // world_size))
     torch.random.default_generator.manual_seed(env.seed)
@@ -320,12 +342,14 @@ def train(config):
     )
 
     if world_size > 1:
-        generator = DistributedDataParallel(
-            generator, device_ids=[local_rank],
-        )
-        discriminator = DistributedDataParallel(
-            discriminator, device_ids=[local_rank],
-        )
+        ddp_kwargs = {
+            'device_ids': [device_index],
+            'output_device': device_index,
+            'broadcast_buffers': False,
+            'static_graph': True,
+        }
+        generator = DistributedDataParallel(generator, **ddp_kwargs)
+        discriminator = DistributedDataParallel(discriminator, **ddp_kwargs)
 
     if rank == 0:
         n_params = sum(p.numel() for p in generator.parameters())
@@ -507,13 +531,14 @@ def main():
         raise RuntimeError('CUDA is required for training.')
     configure_runtime()
     rank, local_rank, world_size = resolve_dist_info()
-    torch.cuda.set_device(local_rank)
+    device_index = _device_index(local_rank)
+    torch.cuda.set_device(device_index)
 
     if world_size > 1:
         init_process_group(
             backend='nccl',
             timeout=timedelta(minutes=120),
-            device_id=torch.device('cuda', local_rank),
+            device_id=torch.device('cuda', device_index),
         )
 
     config, args = parse_args()
