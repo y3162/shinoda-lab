@@ -22,3 +22,8 @@ If the target project is ambiguous or cannot be determined from the user's instr
 
 `README.md` files are not for the you but for the users.
 You should not read them.
+
+## Subagents (Token Efficiency)
+
+- Delegate high-noise exploration, diagnosis, testing, and completion checks to the matching custom subagent with a narrow goal, scope, constraints, and concise expected report.
+- Keep the parent as integrator: await read-only background results before making decisions, and never run overlapping writers in the same worktree.
