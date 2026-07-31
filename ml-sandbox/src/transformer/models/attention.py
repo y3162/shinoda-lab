@@ -21,29 +21,28 @@ class Attention(nn.Module):
 
         print_log(config)
         self.d_model = config.d_model
-        self.n_heads = config.n_heads
-        if 'd_head' in config:
-            self.d_head = config.d_head
-        else:
-            assert self.d_model % self.n_heads == 0, "'d_model' should be a multiple of 'n_heads'"
-            self.d_head = self.d_model // self.n_heads
-        self.d_v = config.d_v
+        self.n_heads = config.get('n_heads', 1)
+        self.d_head = config.get('d_head', self.d_model // self.n_heads)
+        self.d_v = config.get('d_v', self.d_model)
 
         self.w_q = nn.Linear(self.d_model, self.d_head * self.n_heads)
         self.w_k = nn.Linear(self.d_model, self.d_head * self.n_heads)
         self.w_v = nn.Linear(self.d_model, self.d_v * self.n_heads)
+
         self.w_o = nn.Linear(self.d_v * self.n_heads, self.d_model)
 
     def _split_head(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+
         return x.view(*x.shape[:-1], self.n_heads, -1).movedim(-2, -3)
 
     def _concat_head(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+
         return x.movedim(-3, -2).flatten(-2)
 
     def forward(
@@ -51,6 +50,7 @@ class Attention(nn.Module):
         x_q: torch.Tensor,
         x_kv: torch.Tensor,
     ) -> torch.Tensor:
+
         query = self.w_q(x_q)
         key = self.w_k(x_kv)
         value = self.w_v(x_kv)
