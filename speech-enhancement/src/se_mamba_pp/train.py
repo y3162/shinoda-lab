@@ -1,9 +1,37 @@
 import argparse
 import itertools
 import json
+import os
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
+
+
+def _remask_cuda_visible_devices_before_torch() -> None:
+    """Make each DDP rank see only its own GPU.
+
+    With CUDA_VISIBLE_DEVICES=1,4,5, every rank can see three devices. The first
+    CUDA call (e.g. torch.cuda.is_available) creates a primary context on
+    logical device 0 (= physical GPU 1), so non-zero ranks leak ~400MiB there.
+    Remask before importing torch so each process only initializes one device.
+    """
+    if 'LOCAL_RANK' not in os.environ:
+        return
+    cvd = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if cvd is None or cvd.strip() == '':
+        return
+    devices = [d.strip() for d in cvd.split(',') if d.strip() != '']
+    local_rank = int(os.environ['LOCAL_RANK'])
+    if local_rank < 0 or local_rank >= len(devices):
+        raise RuntimeError(
+            f'LOCAL_RANK={local_rank} out of range for '
+            f'CUDA_VISIBLE_DEVICES={cvd!r} ({len(devices)} devices)'
+        )
+    os.environ['CUDA_VISIBLE_DEVICES'] = devices[local_rank]
+    os.environ['LOCAL_RANK'] = '0'
+
+
+_remask_cuda_visible_devices_before_torch()
 
 import torch
 import torch.distributed as dist
@@ -506,11 +534,12 @@ def train(config):
 
 
 def main():
-    if not torch.cuda.is_available():
-        raise RuntimeError('CUDA is required for training.')
     configure_runtime()
     rank, local_rank, world_size = resolve_dist_info()
+    # Must be the first CUDA call so only this device gets a primary context.
     torch.cuda.set_device(local_rank)
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA is required for training.')
 
     if world_size > 1:
         init_process_group(

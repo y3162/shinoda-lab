@@ -1,5 +1,6 @@
 from typing import Iterable, Iterator, List, Tuple
-NoiseRow = Tuple[str, str, str, int, int, int]
+
+NoiseRow = Tuple[str, str, str, str, int, int, int]
 
 import duckdb as db
 from tqdm import tqdm
@@ -10,8 +11,9 @@ from src.utils.print import (
     print_error,
 )
 from src.utils.demand import (
-    find_all_audio_files,
+    find_clipped_audio_files,
     get_noise_type,
+    parse_clip_split,
 )
 from src.config import SQL_ROOT
 
@@ -33,14 +35,17 @@ def batched(
 
 
 def iter_noise_rows() -> Iterator[NoiseRow]:
-    audio_files = find_all_audio_files()
+    audio_files = sorted(find_clipped_audio_files())
 
     for audio_file in tqdm(
         audio_files,
-        desc='Parsing audio files',
+        desc='Parsing clipped DEMAND files',
         unit='file',
     ):
-        audio, sample_rate = torchaudio.load(audio_file)
+        split = parse_clip_split(audio_file)
+        if split is None:
+            continue
+        audio, sample_rate = torchaudio.load(str(audio_file))
         assert audio.dim() == 2, 'Audio must have 2 dimensions'
         channels = audio.shape[0]
         frame_count = audio.shape[1]
@@ -48,6 +53,7 @@ def iter_noise_rows() -> Iterator[NoiseRow]:
             'demand',
             str(audio_file),
             get_noise_type(audio_file),
+            split,
             sample_rate,
             channels,
             frame_count,
@@ -63,11 +69,12 @@ def insert_noises(
             dataset_name,
             audio_path,
             noise_type,
+            split,
             sample_rate,
             channels,
             frame_count
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     """
 
     con.execute('BEGIN TRANSACTION')

@@ -133,15 +133,37 @@ def _max_frame_count(con, splits):
     return int(row[0])
 
 
-def _load_noise_options(con, noise_config_ids):
+def _infer_noise_split(utterance_splits):
+    kinds = set()
+    for name in utterance_splits:
+        if name.startswith('train'):
+            kinds.add('train')
+        elif name.startswith('dev'):
+            kinds.add('dev')
+        elif name.startswith('test'):
+            kinds.add('test')
+        else:
+            raise ValueError(f'Cannot map utterance split to noise split: {name}')
+    if len(kinds) != 1:
+        raise ValueError(
+            f'Utterance splits must map to one noise split, got {utterance_splits} -> {kinds}'
+        )
+    return next(iter(kinds))
+
+
+def _load_noise_options(con, noise_config_ids, noise_split=None):
     if noise_config_ids is None:
+        if noise_split is None:
+            raise ValueError('noise_split is required when noise_config_ids is None')
         rows = con.execute(
             """
             SELECT id
             FROM noise_configs
             WHERE json_array_length(config_json->'$.args') <> 0
+              AND json_extract_string(config_json, '$.split') = ?
             ORDER BY id
-            """
+            """,
+            [noise_split],
         ).fetchall()
         noise_config_ids = [row[0] for row in rows]
     else:
@@ -156,6 +178,8 @@ def _load_noise_options(con, noise_config_ids):
     for noise_config_id in noise_config_ids:
         option = get_noise_option(con, noise_config_id)
         if not option.get('args'):
+            continue
+        if noise_split is not None and option.get('split') not in (None, noise_split):
             continue
         options.append(option)
 
@@ -173,16 +197,22 @@ class LibriSpeechNoiseDataset(torch.utils.data.Dataset):
         segment_size,
         sampling_rate,
         noise_config_ids=None,
+        noise_split=None,
         split=True,
         max_frames=None,
     ):
         if not splits:
             raise ValueError('splits must be a non-empty list')
 
+        if noise_split is None:
+            noise_split = _infer_noise_split(splits)
+
         con = db.connect(str(sql_root), read_only=True)
         try:
             self.utterances = _load_librispeech_utterances(con, splits)
-            self.noise_options = _load_noise_options(con, noise_config_ids)
+            self.noise_options = _load_noise_options(
+                con, noise_config_ids, noise_split=noise_split,
+            )
         finally:
             con.close()
 
@@ -285,6 +315,7 @@ def build_datasets(config):
             data.segment_size,
             data.sampling_rate,
             noise_config_ids=ls.noise_config_ids,
+            noise_split=getattr(ls, 'noise_split', None) or 'train',
             split=True,
         )
         validset = LibriSpeechNoiseDataset(
@@ -293,6 +324,7 @@ def build_datasets(config):
             data.segment_size,
             data.sampling_rate,
             noise_config_ids=ls.noise_config_ids,
+            noise_split='dev',
             split=False,
             max_frames=max_frames,
         )

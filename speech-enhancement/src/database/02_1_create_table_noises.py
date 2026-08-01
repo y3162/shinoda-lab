@@ -29,6 +29,7 @@ def create_noises_table_if_needed(
             dataset_name    VARCHAR NOT NULL,
             audio_path      VARCHAR NOT NULL,
             noise_type      VARCHAR NOT NULL,
+            split           VARCHAR NOT NULL CHECK (split IN ('train', 'dev', 'test')),
             sample_rate     INTEGER NOT NULL,
             channels        INTEGER NOT NULL,
             frame_count     INTEGER NOT NULL,
