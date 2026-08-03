@@ -40,7 +40,9 @@
             "prefetch_factor": 2,
             "epochs": 400,
             "summary_interval": 100,
-            "max_steps": null
+            "max_steps": null,
+            "val_batch_size": 4,
+            "pesq_num_workers": 4
         },
         "optim": {
             "learning_rate": 0.0005,

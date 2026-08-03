@@ -207,6 +207,7 @@ class LibriSpeechNoiseDataset(torch.utils.data.Dataset):
         split=True,
         max_frames=None,
         use_pcs400=False,
+        seed=None,
     ):
         if not splits:
             raise ValueError('splits must be a non-empty list')
@@ -228,6 +229,7 @@ class LibriSpeechNoiseDataset(torch.utils.data.Dataset):
         self.split = split
         self.max_frames = max_frames
         self.use_pcs400 = use_pcs400 and split
+        self.seed = seed
 
     def _load_clean_audio(self, audio_path):
         waveform, sample_rate = torchaudio.load(audio_path)
@@ -250,15 +252,26 @@ class LibriSpeechNoiseDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         from src.utils.noise import NoiseGenerator
+        from src.utils.validation import deterministic_noise_seed
 
         _, audio_path = self.utterances[index]
         clean_audio = self._load_clean_audio(audio_path)
 
-        noise_option = random.choice(self.noise_options)
+        if self.seed is None:
+            noise_option = random.choice(self.noise_options)
+            torch_rng = None
+        else:
+            sample_seed = deterministic_noise_seed(self.seed, index)
+            py_rng = random.Random(sample_seed)
+            noise_option = py_rng.choice(self.noise_options)
+            torch_rng = torch.Generator()
+            torch_rng.manual_seed(sample_seed & 0xFFFFFFFFFFFFFFFF)
+
         generator = NoiseGenerator(noise_option)
         noisy_result = generator.generate(
             clean_audio.clone(),
             self.sampling_rate,
+            rng=torch_rng,
         )
         noisy_audio = noisy_result.audio
 
@@ -344,6 +357,7 @@ def build_datasets(config):
             split=False,
             max_frames=max_frames,
             use_pcs400=False,
+            seed=config.train.env.seed,
         )
         return trainset, validset
 

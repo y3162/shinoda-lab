@@ -32,7 +32,7 @@
         "d_state": 16,
         "d_conv": 4,
         "expand": 2,
-        "norm_epsilon": 0.00001,
+        "norm_epsilon": 1e-05,
         "beta": 2.0,
         "input_channel": 2,
         "output_channel": 1,
@@ -46,7 +46,9 @@
             "prefetch_factor": 2,
             "epochs": 100,
             "summary_interval": 100,
-            "max_steps": null
+            "max_steps": null,
+            "val_batch_size": 2,
+            "pesq_num_workers": 4
         },
         "optim": {
             "learning_rate": 0.0002,

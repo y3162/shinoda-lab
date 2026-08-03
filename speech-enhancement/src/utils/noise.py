@@ -55,10 +55,12 @@ class NoiseGenerator:
         self,
         audio: torch.Tensor,
         sample_rate: int,
+        rng: torch.Generator | None = None,
     )->torch.Tensor:
         return self.generator.generate(
             audio,
             sample_rate,
+            rng=rng,
         )
 
 
@@ -74,11 +76,13 @@ class AdditiveNoiseGenerator:
         self,
         audio: torch.Tensor,
         sample_rate: int,
+        rng: torch.Generator | None = None,
     ) -> torch.Tensor:
         return add_noise(
             audio,
             sample_rate,
             self.arg_settings,
+            rng=rng,
         )
 
 
@@ -86,6 +90,7 @@ def add_noise(
     audio: torch.Tensor,
     sample_rate: int,
     options: List[dict],
+    rng: torch.Generator | None = None,
 )->torch.Tensor:
     if sample_rate != DEFAULT_SAMPLE_RATE:
         print_warning(f'Sample rate must be DEFAULT_SAMPLE_RATE, but got {sample_rate}')
@@ -99,6 +104,7 @@ def add_noise(
                     audio=noised_audio,
                     sample_rate=sample_rate,
                     option=option,
+                    rng=rng,
                 )
                 noised_audio = result.audio
                 used_options.append(result.option)
@@ -150,6 +156,7 @@ def audiofile_noise_generation(
     audio: torch.Tensor,
     sample_rate: int,
     option: dict={},
+    rng: torch.Generator | None = None,
 )->torch.Tensor:
     common_option = __parse_common_option(audio, sample_rate, option)
     snr_db = common_option.snr_db
@@ -167,7 +174,17 @@ def audiofile_noise_generation(
     if noise.shape[-1] < noise_duration:
         repeats = (noise_duration // noise.shape[-1]) + 1
         noise = noise.repeat(repeats)
-    audiofile_start_frame = 0 if noise.shape[-1] == noise_duration else torch.randint(0, noise.shape[-1] - noise_duration, (1,)).item()
+    if noise.shape[-1] == noise_duration:
+        audiofile_start_frame = 0
+    else:
+        audiofile_start_frame = int(
+            torch.randint(
+                0,
+                noise.shape[-1] - noise_duration,
+                (1,),
+                generator=rng,
+            ).item()
+        )
     audiofile_end_frame = audiofile_start_frame + noise_duration
     noise = noise[..., audiofile_start_frame:audiofile_end_frame]
     signal_power = audio.pow(2).mean()

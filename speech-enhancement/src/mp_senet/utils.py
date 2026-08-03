@@ -189,7 +189,7 @@ def save_latest_checkpoint(
     optim_d,
     steps,
     epoch,
-    best_loss,
+    best_pesq,
     world_size,
 ):
     run_dir = Path(run_dir)
@@ -205,7 +205,7 @@ def save_latest_checkpoint(
             'optim_d': optim_d.state_dict(),
             'steps': steps,
             'epoch': epoch,
-            'best_loss': best_loss,
+            'best_pesq': best_pesq,
         },
     )
 

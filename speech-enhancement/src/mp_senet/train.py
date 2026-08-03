@@ -33,6 +33,11 @@ from src.mp_senet.utils import (
     worker_init_fn,
 )
 from src.utils.print import print_log
+from src.utils.validation import (
+    collect_unpadded_waveforms,
+    compute_pesq_parallel,
+    pad_collate,
+)
 
 torch.backends.cudnn.benchmark = True
 
@@ -72,6 +77,8 @@ def parse_args():
         ('train.env.epochs', int),
         ('train.env.summary_interval', int),
         ('train.env.max_steps', int),
+        ('train.env.val_batch_size', int),
+        ('train.env.pesq_num_workers', int),
         ('train.optim.learning_rate', float),
         ('train.optim.adam_b1', float),
         ('train.optim.adam_b2', float),
@@ -226,6 +233,9 @@ def validate(
     generator.eval()
     discriminator.eval()
     torch.cuda.empty_cache()
+    env = config.train.env
+    val_batch_size = max(1, int(getattr(env, 'val_batch_size', 4)))
+    pesq_num_workers = max(1, int(getattr(env, 'pesq_num_workers', 4)))
     valid_sampler = (
         DistributedSampler(validset, shuffle=False, drop_last=False)
         if world_size > 1 else None
@@ -235,27 +245,31 @@ def validate(
         num_workers=0,
         shuffle=False,
         sampler=valid_sampler,
-        batch_size=1,
+        batch_size=val_batch_size,
         pin_memory=True,
         drop_last=False,
+        collate_fn=pad_collate,
     )
     loss_w = config.train.loss
     totals = {
         'mag': 0.0, 'pha': 0.0, 'com': 0.0, 'stft': 0.0, 'gen': 0.0, 'n': 0,
     }
+    ref_waveforms = []
+    est_waveforms = []
     pbar = None
     if rank == 0:
         pbar = make_progress_bar(
             total=len(loader),
             desc='Validation {}/{}'.format(epoch + 1, config.train.env.epochs),
-            unit='sample',
+            unit='batch',
             leave=False,
         )
 
     with torch.no_grad():
-        for clean_audio, noisy_audio in loader:
+        for clean_audio, noisy_audio, lengths in loader:
             clean_audio = clean_audio.to(device, non_blocking=True)
             noisy_audio = noisy_audio.to(device, non_blocking=True)
+            lengths = lengths.to(device, non_blocking=True)
             outputs, loss_mag, loss_pha, loss_com, loss_stft = forward_batch(
                 generator, clean_audio, noisy_audio, config,
             )
@@ -266,6 +280,7 @@ def validate(
                 audio_g = audio_g[:, : clean_audio.size(1)]
             elif audio_g.size(1) < clean_audio.size(1):
                 clean_audio = clean_audio[:, : audio_g.size(1)]
+                lengths = torch.clamp(lengths, max=audio_g.size(1))
 
             one_labels = torch.ones(clean_audio.size(0), device=device)
             loss_time = F.l1_loss(clean_audio, audio_g)
@@ -280,12 +295,18 @@ def validate(
                 + loss_time * loss_w.time
             )
 
-            totals['mag'] += loss_mag.item()
-            totals['pha'] += loss_pha.item()
-            totals['com'] += loss_com.item() / 2
-            totals['stft'] += loss_stft.item() / 2
-            totals['gen'] += loss_gen_all.item()
-            totals['n'] += 1
+            batch_n = clean_audio.size(0)
+            totals['mag'] += loss_mag.item() * batch_n
+            totals['pha'] += loss_pha.item() * batch_n
+            totals['com'] += (loss_com.item() / 2) * batch_n
+            totals['stft'] += (loss_stft.item() / 2) * batch_n
+            totals['gen'] += loss_gen_all.item() * batch_n
+            totals['n'] += batch_n
+
+            refs, ests = collect_unpadded_waveforms(clean_audio, audio_g, lengths)
+            ref_waveforms.extend(refs)
+            est_waveforms.extend(ests)
+
             if pbar is not None:
                 pbar.set_postfix(format_postfix(
                     gen=loss_gen_all.item(),
@@ -299,13 +320,22 @@ def validate(
     if pbar is not None:
         pbar.close()
 
+    pesq_sum, pesq_n = compute_pesq_parallel(
+        ref_waveforms,
+        est_waveforms,
+        config.data.sampling_rate,
+        pesq_num_workers,
+    )
+
     n = aggregate_sum(totals['n'], device, world_size)
+    pesq_n = aggregate_sum(pesq_n, device, world_size)
     return {
         'mag': aggregate_sum(totals['mag'], device, world_size) / max(n, 1),
         'pha': aggregate_sum(totals['pha'], device, world_size) / max(n, 1),
         'com': aggregate_sum(totals['com'], device, world_size) / max(n, 1),
         'stft': aggregate_sum(totals['stft'], device, world_size) / max(n, 1),
         'gen': aggregate_sum(totals['gen'], device, world_size) / max(n, 1),
+        'pesq': aggregate_sum(pesq_sum, device, world_size) / max(pesq_n, 1),
     }
 
 
@@ -320,7 +350,7 @@ def train(config):
 
     steps = 0
     last_epoch = -1
-    best_loss = float('inf')
+    best_pesq = 0.0
     do_path = Path(config.checkpoint_root) / 'do_latest'
     g_path = Path(config.checkpoint_root) / 'g_latest'
     state_dict_do = None
@@ -330,11 +360,11 @@ def train(config):
         state_dict_do = load_checkpoint(do_path, device)
         steps = state_dict_do['steps'] + 1
         last_epoch = state_dict_do['epoch']
-        best_loss = float(state_dict_do.get('best_loss', float('inf')))
+        best_pesq = float(state_dict_do.get('best_pesq', 0.0))
         if rank == 0:
             print_log(
                 f"Loaded checkpoint (step {state_dict_do['steps']}, "
-                f"epoch {state_dict_do['epoch'] + 1}, best_loss={best_loss:.3f})",
+                f"epoch {state_dict_do['epoch'] + 1}, best_pesq={best_pesq:.3f})",
             )
 
     generator, discriminator, optim_g, optim_d = build_models(config, device)
@@ -485,7 +515,7 @@ def train(config):
                 save_latest_checkpoint(
                     config.checkpoint_root,
                     generator, discriminator, optim_g, optim_d,
-                    steps, epoch - 1, best_loss, world_size,
+                    steps, epoch - 1, best_pesq, world_size,
                 )
                 print_log(f'Stopped at max_steps={env.max_steps} (step {steps})')
             break
@@ -495,30 +525,31 @@ def train(config):
         )
         if rank == 0:
             msg = (
-                'Validation (epoch {}/{}): gen={:.3f}, mag={:.3f}, '
+                'Validation (epoch {}/{}): PESQ={:.3f}, gen={:.3f}, mag={:.3f}, '
                 'pha={:.3f}, com={:.3f}, stft={:.3f}'
             ).format(
                 epoch + 1, env.epochs,
-                val_metrics['gen'], val_metrics['mag'], val_metrics['pha'],
-                val_metrics['com'], val_metrics['stft'],
+                val_metrics['pesq'], val_metrics['gen'], val_metrics['mag'],
+                val_metrics['pha'], val_metrics['com'], val_metrics['stft'],
             )
             tqdm.write(msg)
             print_log(msg)
+            sw.add_scalar('Validation/PESQ Score', val_metrics['pesq'], epoch + 1)
             sw.add_scalar('Validation/Generator Loss', val_metrics['gen'], epoch + 1)
             sw.add_scalar('Validation/Magnitude Loss', val_metrics['mag'], epoch + 1)
             sw.add_scalar('Validation/Phase Loss', val_metrics['pha'], epoch + 1)
             sw.add_scalar('Validation/Complex Loss', val_metrics['com'], epoch + 1)
             sw.add_scalar('Validation/Consistency Loss', val_metrics['stft'], epoch + 1)
-            if val_metrics['gen'] < best_loss:
-                best_loss = val_metrics['gen']
+            if val_metrics['pesq'] > best_pesq:
+                best_pesq = val_metrics['pesq']
                 save_best_checkpoint(config.checkpoint_root, generator, world_size)
                 print_log(
-                    f'Updated best checkpoint (loss={best_loss:.3f}) at epoch {epoch + 1}',
+                    f'Updated best checkpoint (PESQ={best_pesq:.3f}) at epoch {epoch + 1}',
                 )
             save_latest_checkpoint(
                 config.checkpoint_root,
                 generator, discriminator, optim_g, optim_d,
-                steps, epoch, best_loss, world_size,
+                steps, epoch, best_pesq, world_size,
             )
             print_log(f'Saved latest checkpoint at end of epoch {epoch + 1} (step {steps})')
 
