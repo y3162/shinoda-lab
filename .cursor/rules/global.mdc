@@ -1,29 +1,89 @@
 ---
-description: Global rules for the entire repository and AI behavior guidelines
+description: Global repository rules and AI behavior guidelines
 globs: "*"
 alwaysApply: true
 ---
 
-# Global Monorepo Rules
+# Global Repository and Assistant Policy
 
-## Project Selection (CRITICAL)
+## 1. Highest-Priority Rules (CRITICAL)
+
+- Do not proceed based on assumptions when any requirement, specification, environment, objective, or prerequisite is unclear.
+- Before providing a conclusion, implementation, file modification, or command, ask for the missing information if even one clarification is necessary.
+- Do not create, modify, or suggest changes to files when the requirements, target, environment, or purpose are not sufficiently clear.
+- If something is technically impossible or cannot be determined from the available information, explicitly state that it cannot be done or cannot be determined.
+- If you cannot comply with these rules, do not force an answer or implementation. Explain why and state what information is required.
+
+## 2. Project Selection in This Monorepo (CRITICAL)
 
 This repository is a monorepo containing multiple projects.
-Before creating or modifying files, or suggesting commands, you MUST **identify which project (subdirectory) is the current target of the operation**.
-If the target project is ambiguous or cannot be determined from the user's instructions, DO NOT GUESS. You must stop and explicitly ask the user: "Which project are we working on?"
 
-## Working Directory & Commands
+- Before creating or modifying files, or suggesting commands, identify the target project and its subdirectory.
+- If the target project cannot be determined unambiguously from the user's instructions, do not guess.
+- In that case, stop and ask exactly: **"Which project are we working on?"**
+- When considering file paths, imports, commands, or configuration, treat the root directory of the identified target project as the working directory.
 
-- When considering file paths or code imports, always assume the **root directory of the target project** is the current working directory.
-- If you cannot find a command or its alternatives, **do not install it**. Instead, ask me.
-- Before using GPUs, you need to check if the GPUs are available using `nvidia-smi`.
+## 3. Evidence, Assumptions, and Information Handling
 
-## READMEs
+- Do not make unsupported assumptions or assertions.
+- Do not present speculation as fact, including through phrases such as “probably,” “likely,” or “generally.”
+- Clearly distinguish facts, stated assumptions, inferences, and decisions.
+- When appropriate, provide alternatives, constraints, and conditional solutions.
+- If current accuracy matters and reliable internet access is available, consult trustworthy sources.
+- When using external sources, state the source and the date of access.
 
-`README.md` files are not for the you but for the users.
-You should not read them.
+## 4. Required Workflow
 
-## Subagents (Token Efficiency)
+- Before answering or implementing, confirm the necessary requirements, specifications, environment, and objective.
+- Inspect relevant existing files, code, configuration, and uncommitted changes before working on them.
+- If information is missing, create or update a Markdown question file and wait for the user's response.
+- If the response remains insufficient, explicitly state what is still missing and add further questions as needed.
+- If a response creates new unanswered questions, add them before proceeding.
+- Prioritize correctness, validity, reproducibility, and verification over speed.
+- Do not skip necessary checks or validation merely to save time.
 
-- Delegate high-noise exploration, diagnosis, testing, and completion checks to the matching custom subagent with a narrow goal, scope, constraints, and concise expected report.
-- Keep the parent as integrator: await read-only background results before making decisions, and never run overlapping writers in the same worktree.
+## 5. Asking Questions
+
+Do not ask clarification questions only in chat. Instead, create or update a Markdown file using the following format:
+
+```md
+# Questions
+
+[Question]
+
+# Options
+
+[Recommended option + explanation]
+
+[Alternative option + explanation]
+
+...
+
+[Other (optional)]
+
+# Answer
+
+# Notes
+````
+
+* List options in recommended order.
+* Wait for the user's response before proceeding when clarification is required.
+
+## 6. Commands, Tools, and Environment
+
+* If a command or a suitable alternative cannot be found, do not install new tools or packages. Ask the user instead.
+* Do not assume unavailable tools, permissions, files, credentials, or environments exist.
+* Before using GPUs, check their availability with `nvidia-smi`.
+
+## 7. README Files
+
+* `README.md` files are intended for users, not for the assistant.
+* Do not read `README.md` files.
+
+## 8. Subagents and Large Investigations
+
+* When many files must be investigated, use available subagents to divide the work when appropriate.
+* Delegate high-noise exploration, diagnosis, testing, and completion checks to a suitable subagent with a narrow goal, scope, constraints, and expected report.
+* Keep the parent agent responsible for integration and final decisions.
+* Collect read-only subagent results before making decisions.
+* Never allow overlapping writers to modify the same worktree.
