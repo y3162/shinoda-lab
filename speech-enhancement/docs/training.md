@@ -119,19 +119,6 @@ torchrun --standalone --nproc_per_node=1 -m src.se_mamba.train \
     --resume data/checkpoints/se_mamba/<YYYYMMDD_HHMMSS>
 ```
 
-### Inference
-
-```bash
-python -m src.se_mamba.infer \
-    --checkpoint data/checkpoints/se_mamba/<YYYYMMDD_HHMMSS> \
-    --input_folder path/to/noisy_wavs \
-    --output_folder path/to/enhanced \
-    --post_processing_pcs false
-```
-
-`--checkpoint` may be a run directory (`g_best` preferred, else `g_latest`) or a checkpoint file.
-Omit `--config` to load `<run>/config.json`.
-
 ---
 
 ## Multi-GPU
