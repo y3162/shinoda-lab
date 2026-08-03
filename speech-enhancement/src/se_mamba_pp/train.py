@@ -56,7 +56,6 @@ from src.se_mamba_pp.model.stfts import forward_generator_batch
 from src.se_mamba_pp.utils import (
     aggregate_sum,
     apply_overrides,
-    cal_pesq,
     configure_runtime,
     format_postfix,
     json_to_namespace,
@@ -216,8 +215,12 @@ def forward_batch(generator, clean_audio, noisy_audio, config):
     return outputs, loss_mag, loss_pha, loss_com, loss_con
 
 
-def validate(generator, validset, device, config, rank, world_size, epoch):
+def validate(
+    generator, mssbcqtd, mrd, fn_mel_loss, validset, device, config, rank, world_size, epoch,
+):
     generator.eval()
+    mssbcqtd.eval()
+    mrd.eval()
     torch.cuda.empty_cache()
     valid_sampler = (
         DistributedSampler(validset, shuffle=False, drop_last=False)
@@ -232,7 +235,10 @@ def validate(generator, validset, device, config, rank, world_size, epoch):
         pin_memory=True,
         drop_last=False,
     )
-    totals = {'mag': 0.0, 'pha': 0.0, 'com': 0.0, 'con': 0.0, 'pesq': 0.0, 'n': 0, 'pesq_n': 0}
+    loss_w = config.train.loss
+    totals = {
+        'mag': 0.0, 'pha': 0.0, 'com': 0.0, 'con': 0.0, 'gen': 0.0, 'n': 0,
+    }
     pbar = None
     if rank == 0:
         pbar = make_progress_bar(
@@ -255,24 +261,36 @@ def validate(generator, validset, device, config, rank, world_size, epoch):
             elif audio_g.size(1) < clean_audio.size(1):
                 clean_audio = clean_audio[:, : audio_g.size(1)]
 
-            for ref, est in zip(
-                torch.split(clean_audio, 1, dim=0),
-                torch.split(audio_g, 1, dim=0),
-            ):
-                totals['pesq'] += cal_pesq(
-                    ref.squeeze().cpu().numpy(),
-                    est.squeeze().cpu().numpy(),
-                    config.data.sampling_rate,
-                )
-                totals['pesq_n'] += 1
+            y_dq_hat_r, y_dq_hat_g, fmap_q_r, fmap_q_g = mssbcqtd(
+                clean_audio.unsqueeze(1), audio_g.unsqueeze(1),
+            )
+            y_dr_hat_r, y_dr_hat_g, fmap_r_r, fmap_r_g = mrd(
+                clean_audio.unsqueeze(1), audio_g.unsqueeze(1),
+            )
+            adv_g_loss = (
+                generator_loss(y_dq_hat_g)[0] + generator_loss(y_dr_hat_g)[0]
+            )
+            fm_g_loss = feature_loss(fmap_q_r, fmap_q_g) + feature_loss(fmap_r_r, fmap_r_g)
+            mel_loss = fn_mel_loss(clean_audio.unsqueeze(1), audio_g.unsqueeze(1))
+            loss_gen_all = (
+                adv_g_loss * loss_w.adv_g
+                + fm_g_loss * loss_w.fm_g
+                + mel_loss * loss_w.mel
+                + loss_mag * loss_w.magnitude
+                + loss_pha * loss_w.phase
+                + loss_com * loss_w.complex
+                + loss_con * loss_w.consistancy
+            )
 
             totals['mag'] += loss_mag.item()
             totals['pha'] += loss_pha.item()
             totals['com'] += loss_com.item() / 2
             totals['con'] += loss_con.item() / 2
+            totals['gen'] += loss_gen_all.item()
             totals['n'] += 1
             if pbar is not None:
                 pbar.set_postfix(format_postfix(
+                    gen=loss_gen_all.item(),
                     mag=loss_mag.item(),
                     pha=loss_pha.item(),
                     com=loss_com.item() / 2,
@@ -284,13 +302,12 @@ def validate(generator, validset, device, config, rank, world_size, epoch):
         pbar.close()
 
     n = aggregate_sum(totals['n'], device, world_size)
-    pesq_n = aggregate_sum(totals['pesq_n'], device, world_size)
     return {
         'mag': aggregate_sum(totals['mag'], device, world_size) / max(n, 1),
         'pha': aggregate_sum(totals['pha'], device, world_size) / max(n, 1),
         'com': aggregate_sum(totals['com'], device, world_size) / max(n, 1),
         'stft': aggregate_sum(totals['con'], device, world_size) / max(n, 1),
-        'pesq': aggregate_sum(totals['pesq'], device, world_size) / max(pesq_n, 1),
+        'gen': aggregate_sum(totals['gen'], device, world_size) / max(n, 1),
     }
 
 
@@ -305,7 +322,7 @@ def train(config):
 
     steps = 0
     last_epoch = -1
-    best_pesq = 0.0
+    best_loss = float('inf')
     do_path = Path(config.checkpoint_root) / 'do_latest'
     g_path = Path(config.checkpoint_root) / 'g_latest'
     state_dict_do = None
@@ -314,11 +331,11 @@ def train(config):
         state_dict_do = load_checkpoint(do_path, device)
         steps = state_dict_do['steps'] + 1
         last_epoch = state_dict_do['epoch']
-        best_pesq = float(state_dict_do.get('best_pesq', 0.0))
+        best_loss = float(state_dict_do.get('best_loss', float('inf')))
         if rank == 0:
             print_log(
                 f"Loaded checkpoint (step {state_dict_do['steps']}, "
-                f"epoch {state_dict_do['epoch'] + 1}, best_pesq={best_pesq:.3f})",
+                f"epoch {state_dict_do['epoch'] + 1}, best_loss={best_loss:.3f})",
             )
 
     generator, mssbcqtd, mrd, fn_mel_loss, optim_g, optim_d = build_models(config, device)
@@ -484,44 +501,47 @@ def train(config):
                 save_latest_checkpoint(
                     config.checkpoint_root,
                     generator, mssbcqtd, mrd, optim_g, optim_d,
-                    steps, epoch - 1, best_pesq, world_size,
+                    steps, epoch - 1, best_loss, world_size,
                 )
                 print_log(f'Stopped at max_steps={env.max_steps} (step {steps})')
             break
 
         val_metrics = validate(
-            generator, validset, device, config, rank, world_size, epoch,
+            generator, mssbcqtd, mrd, fn_mel_loss, validset, device, config,
+            rank, world_size, epoch,
         )
         if rank == 0:
             msg = (
-                'Validation (epoch {}/{}): PESQ={:.3f}, mag={:.3f}, '
+                'Validation (epoch {}/{}): gen={:.3f}, mag={:.3f}, '
                 'pha={:.3f}, com={:.3f}, stft={:.3f}'
             ).format(
                 epoch + 1, env.epochs,
-                val_metrics['pesq'], val_metrics['mag'], val_metrics['pha'],
+                val_metrics['gen'], val_metrics['mag'], val_metrics['pha'],
                 val_metrics['com'], val_metrics['stft'],
             )
             tqdm.write(msg)
             print_log(msg)
-            sw.add_scalar('Validation/PESQ Score', val_metrics['pesq'], epoch + 1)
+            sw.add_scalar('Validation/Generator Loss', val_metrics['gen'], epoch + 1)
             sw.add_scalar('Validation/Magnitude Loss', val_metrics['mag'], epoch + 1)
             sw.add_scalar('Validation/Phase Loss', val_metrics['pha'], epoch + 1)
             sw.add_scalar('Validation/Complex Loss', val_metrics['com'], epoch + 1)
             sw.add_scalar('Validation/Consistency Loss', val_metrics['stft'], epoch + 1)
-            if val_metrics['pesq'] > best_pesq:
-                best_pesq = val_metrics['pesq']
+            if val_metrics['gen'] < best_loss:
+                best_loss = val_metrics['gen']
                 save_best_checkpoint(config.checkpoint_root, generator, world_size)
                 print_log(
-                    f'Updated best checkpoint (PESQ={best_pesq:.3f}) at epoch {epoch + 1}',
+                    f'Updated best checkpoint (loss={best_loss:.3f}) at epoch {epoch + 1}',
                 )
             save_latest_checkpoint(
                 config.checkpoint_root,
                 generator, mssbcqtd, mrd, optim_g, optim_d,
-                steps, epoch, best_pesq, world_size,
+                steps, epoch, best_loss, world_size,
             )
             print_log(f'Saved latest checkpoint at end of epoch {epoch + 1} (step {steps})')
 
         generator.train()
+        mssbcqtd.train()
+        mrd.train()
         if world_size > 1:
             dist.barrier()
         scheduler_g.step()
