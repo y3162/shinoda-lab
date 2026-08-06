@@ -15,7 +15,7 @@ from src.utils.demand import (
     get_noise_type,
     parse_clip_split,
 )
-from src.config import SQL_ROOT
+from src.config import PROJECT_ROOT, SQL_ROOT
 
 
 def batched(
@@ -51,7 +51,7 @@ def iter_noise_rows() -> Iterator[NoiseRow]:
         frame_count = audio.shape[1]
         yield (
             'demand',
-            str(audio_file),
+            str(audio_file.relative_to(PROJECT_ROOT)),
             get_noise_type(audio_file),
             split,
             sample_rate,

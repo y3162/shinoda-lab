@@ -16,7 +16,7 @@ from src.utils.librispeech import (
     get_speaker_id,
     get_section_id,
 )
-from src.config import SQL_ROOT
+from src.config import PROJECT_ROOT, SQL_ROOT
 
 
 def batched(
@@ -36,22 +36,33 @@ def batched(
 
 
 def iter_utterance_rows() -> Iterator[UtteranceRow]:
-    transcript_files = find_all_transcript_files()
+    transcript_files = sorted(
+        find_all_transcript_files(),
+        key=lambda path: str(path),
+    )
 
     for transcript_file in tqdm(
         transcript_files,
         desc='Parsing transcript files',
         unit='file',
     ):
-        for audio_path, transcript in parse_transcript_file(transcript_file):
+        utterances = sorted(
+            parse_transcript_file(transcript_file),
+            key=lambda item: str(item[0]),  # audio_path
+        )
+
+        for audio_path, transcript in utterances:
             audio, sample_rate = torchaudio.load(audio_path)
+
             assert audio.dim() == 2, 'Audio must have 2 dimensions'
+
             channels = audio.shape[0]
             frame_count = audio.shape[1]
+
             yield (
                 'librispeech',
                 get_subset_name(audio_path),
-                str(audio_path),
+                str(audio_path.relative_to(PROJECT_ROOT)),
                 get_speaker_id(audio_path),
                 get_section_id(audio_path),
                 transcript,

@@ -1,6 +1,7 @@
 """Insert additive noise_configs: clean, single-file, and dual-file mixes."""
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from collections import defaultdict
@@ -15,13 +16,50 @@ from src.utils.print import (
 )
 from src.config import SQL_ROOT
 
+
 SNR_MIN = -10
 SNR_MAX = 5
+
+SPLIT_ORDER = (
+    'train',
+    'dev',
+    'test',
+)
+
+SPLIT_RANK = {
+    split: index
+    for index, split in enumerate(SPLIT_ORDER)
+}
+
 DUAL_COUNTS = {
     'train': 200,
     'dev': 40,
     'test': 40,
 }
+
+
+def dumps_config(config: dict) -> str:
+    """Convert a config to a canonical JSON string."""
+    return json.dumps(
+        config,
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+
+
+def get_split_seed(
+    seed: int,
+    split: str,
+) -> int:
+    """Generate a process-independent seed for each split."""
+    value = f'{seed}:{split}'.encode('utf-8')
+    digest = hashlib.sha256(value).digest()
+
+    return int.from_bytes(
+        digest[:8],
+        byteorder='big',
+        signed=False,
+    )
 
 
 def insert_noise_config(
@@ -38,39 +76,69 @@ def insert_noise_config(
 
     rows = con.execute(
         """
-        SELECT id, noise_type, split
+        SELECT
+            id,
+            noise_type,
+            split
         FROM noises
-        ORDER BY noise_type, split, id
         """
     ).fetchall()
+
     if not rows:
         print_error('noises table is empty; insert clipped DEMAND first')
         raise SystemExit(1)
 
+    # DBから返される順序に依存せず、Python側で明示的にソートする
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            SPLIT_RANK.get(str(row[2]), len(SPLIT_RANK)),
+            str(row[2]),
+            str(row[1]),
+            int(row[0]),
+        ),
+    )
+
     by_split_type: dict[str, dict[str, list[int]]] = defaultdict(
         lambda: defaultdict(list)
     )
+
     for noise_id, noise_type, split in rows:
-        by_split_type[split][noise_type].append(int(noise_id))
+        by_split_type[str(split)][str(noise_type)].append(int(noise_id))
+
+    # 念のため、各noise_type内のIDも明示的にソートする
+    for type_to_ids in by_split_type.values():
+        for noise_ids in type_to_ids.values():
+            noise_ids.sort()
 
     con.execute('BEGIN TRANSACTION')
-    with tqdm(desc='Inserted noise_configs', unit='rows') as pbar:
-        # Clean (no noise)
-        con.execute(insert_sql, [json.dumps(
-            {
+
+    try:
+        with tqdm(desc='Inserted noise_configs', unit='rows') as pbar:
+            # 1. Clean
+            clean_config = {
                 'generator_type': 'additive',
                 'args': [],
             }
-        )])
-        pbar.update(1)
 
-        # Single-file additive: every clip x SNR
-        for noise_id, noise_type, split in rows:
-            for snr in range(SNR_MIN, SNR_MAX + 1):
-                con.execute(insert_sql, [json.dumps(
-                    {
+            con.execute(
+                insert_sql,
+                [dumps_config(clean_config)],
+            )
+            pbar.update(1)
+
+            # 2. Single
+            #
+            # rows:
+            # split -> noise_type -> noise_id
+            #
+            # snr:
+            # -10 -> -9 -> ... -> 5
+            for noise_id, noise_type, split in rows:
+                for snr in range(SNR_MIN, SNR_MAX + 1):
+                    config = {
                         'generator_type': 'additive',
-                        'split': split,
+                        'split': str(split),
                         'kind': 'single',
                         'args': [
                             {
@@ -80,80 +148,122 @@ def insert_noise_config(
                             }
                         ],
                     }
-                )])
-                pbar.update(1)
 
-        # Dual-file additive: two different noise_types, same split
-        for split, n_dual in DUAL_COUNTS.items():
-            type_to_ids = by_split_type.get(split, {})
-            types = sorted(type_to_ids.keys())
-            if len(types) < 2:
-                print_warning(f'skip dual configs for split={split}: need >=2 types')
-                continue
-            rng = random.Random(seed + hash(split) % 10_000_000)
-            seen: set[tuple] = set()
-            made = 0
-            attempts = 0
-            max_attempts = n_dual * 50
-            while made < n_dual and attempts < max_attempts:
-                attempts += 1
-                t1, t2 = rng.sample(types, 2)
-                id1 = rng.choice(type_to_ids[t1])
-                id2 = rng.choice(type_to_ids[t2])
-                snr1 = rng.randint(SNR_MIN, SNR_MAX)
-                snr2 = rng.randint(SNR_MIN, SNR_MAX)
-                # Canonicalize order for dedup
-                pair = tuple(sorted([
-                    (t1, id1, snr1),
-                    (t2, id2, snr2),
-                ]))
-                if pair in seen:
+                    con.execute(
+                        insert_sql,
+                        [dumps_config(config)],
+                    )
+                    pbar.update(1)
+
+            # 3. Dual
+            for split in SPLIT_ORDER:
+                n_dual = DUAL_COUNTS[split]
+
+                type_to_ids = by_split_type.get(split, {})
+                noise_types = sorted(type_to_ids)
+
+                if len(noise_types) < 2:
+                    print_warning(
+                        f'skip dual configs for split={split}: need >=2 types'
+                    )
                     continue
-                seen.add(pair)
-                (ta, ida, snra), (tb, idb, snrb) = pair
-                con.execute(insert_sql, [json.dumps(
-                    {
+
+                # hash(split)は使わない
+                rng = random.Random(
+                    get_split_seed(seed, split)
+                )
+
+                seen: set[
+                    tuple[
+                        tuple[str, int, int],
+                        tuple[str, int, int],
+                    ]
+                ] = set()
+
+                pairs: list[
+                    tuple[
+                        tuple[str, int, int],
+                        tuple[str, int, int],
+                    ]
+                ] = []
+
+                attempts = 0
+                max_attempts = n_dual * 50
+
+                while len(pairs) < n_dual and attempts < max_attempts:
+                    attempts += 1
+
+                    type_1, type_2 = rng.sample(noise_types, 2)
+
+                    noise_id_1 = rng.choice(type_to_ids[type_1])
+                    noise_id_2 = rng.choice(type_to_ids[type_2])
+
+                    snr_1 = rng.randint(SNR_MIN, SNR_MAX)
+                    snr_2 = rng.randint(SNR_MIN, SNR_MAX)
+
+                    # 順序を正規化する
+                    pair = tuple(sorted([
+                        (
+                            type_1,
+                            int(noise_id_1),
+                            int(snr_1),
+                        ),
+                        (
+                            type_2,
+                            int(noise_id_2),
+                            int(snr_2),
+                        ),
+                    ]))
+
+                    if pair in seen:
+                        continue
+
+                    seen.add(pair)
+                    pairs.append(pair)
+
+                if len(pairs) < n_dual:
+                    print_warning(
+                        f'dual configs for split={split}: '
+                        f'only made {len(pairs)}/{n_dual}'
+                    )
+
+                # 選択自体は疑似乱数だが、挿入順は常に一定にする
+                pairs.sort()
+
+                for pair in pairs:
+                    (
+                        (_, noise_id_1, snr_1),
+                        (_, noise_id_2, snr_2),
+                    ) = pair
+
+                    config = {
                         'generator_type': 'additive',
                         'split': split,
                         'kind': 'dual',
                         'args': [
                             {
                                 'type': 'audiofile',
-                                'noise_id': int(ida),
-                                'snr_db': int(snra),
+                                'noise_id': noise_id_1,
+                                'snr_db': snr_1,
                             },
                             {
                                 'type': 'audiofile',
-                                'noise_id': int(idb),
-                                'snr_db': int(snrb),
+                                'noise_id': noise_id_2,
+                                'snr_db': snr_2,
                             },
                         ],
                     }
-                )])
-                made += 1
-                pbar.update(1)
-            if made < n_dual:
-                print_warning(
-                    f'dual configs for split={split}: only made {made}/{n_dual}'
-                )
 
-    con.execute('COMMIT')
+                    con.execute(
+                        insert_sql,
+                        [dumps_config(config)],
+                    )
+                    pbar.update(1)
+
+        con.execute('COMMIT')
+
+    except Exception:
+        con.execute('ROLLBACK')
+        raise
+
     print_log('noise_configs insert committed')
-
-
-def main() -> None:
-    if SQL_ROOT.exists():
-        print_warning(f'SQL database already exists at {SQL_ROOT}')
-    else:
-        print_log(f'Creating SQL database at {SQL_ROOT}')
-        SQL_ROOT.parent.mkdir(parents=True, exist_ok=True)
-
-    con = db.connect(SQL_ROOT)
-
-    insert_noise_config(con)
-
-    con.close()
-
-
-if __name__ == '__main__':
-    main()

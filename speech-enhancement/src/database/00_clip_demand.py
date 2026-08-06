@@ -22,13 +22,9 @@ import torch
 import torchaudio
 from tqdm import tqdm
 
-from src.config import DEFAULT_SAMPLE_RATE
+from src.config import PROJECT_ROOT, DEMAND_ROOT, DEMAND_CLIPPED_ROOT, DEFAULT_SAMPLE_RATE
 from src.utils.demand import get_noise_type
 from src.utils.print import print_error, print_log
-
-# Always read raw DEMAND; write to clipped root.
-RAW_DEMAND_ROOT = Path(os.environ['DEMAND_ROOT'])
-CLIPPED_ROOT = Path(os.environ['DEMAND_CLIPPED_ROOT'])
 
 SPLIT_REGIONS: dict[str, tuple[float, float]] = {
     'train': (0.0, 260.0),
@@ -39,7 +35,7 @@ SPLIT_REGIONS: dict[str, tuple[float, float]] = {
 
 def _iter_raw_ch01() -> list[Path]:
     files = sorted(
-        p for p in RAW_DEMAND_ROOT.rglob('ch01.wav') if p.is_file()
+        p for p in DEMAND_ROOT.rglob('ch01.wav') if p.is_file()
     )
     return files
 
@@ -112,7 +108,7 @@ def clip_one_file(
                         clip, (0, out_duration_frames - clip.shape[-1]),
                     )
             name = f'ch01_{split}_{idx:03d}'
-            out_wav = CLIPPED_ROOT / noise_type / f'{name}.wav'
+            out_wav = DEMAND_CLIPPED_ROOT / noise_type / f'{name}.wav'
             meta = {
                 'noise_type': noise_type,
                 'split': split,
@@ -123,7 +119,7 @@ def clip_one_file(
                 'sample_rate': target_sr,
                 'source_sample_rate': sr,
                 'seed': seed,
-                'source': str(audio_file),
+                'source': str(audio_file.relative_to(PROJECT_ROOT)),
             }
             _save_clip(clip, target_sr, out_wav, meta)
             n_written += 1
@@ -148,30 +144,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not RAW_DEMAND_ROOT.is_dir():
-        print_error(f'RAW DEMAND_ROOT missing: {RAW_DEMAND_ROOT}')
+    if not DEMAND_ROOT.is_dir():
+        print_error(f'RAW DEMAND_ROOT missing: {DEMAND_ROOT}')
         raise SystemExit(1)
 
-    if CLIPPED_ROOT.exists():
+    if DEMAND_CLIPPED_ROOT.exists():
         if not args.force:
             print_error(
-                f'DEMAND_CLIPPED_ROOT {CLIPPED_ROOT} already exists '
+                f'DEMAND_CLIPPED_ROOT {DEMAND_CLIPPED_ROOT} already exists '
                 '(pass --force to recreate)'
             )
             raise SystemExit(1)
-        print_log(f'Removing existing DEMAND_CLIPPED_ROOT {CLIPPED_ROOT}')
-        shutil.rmtree(CLIPPED_ROOT)
+        print_log(f'Removing existing DEMAND_CLIPPED_ROOT {DEMAND_CLIPPED_ROOT}')
+        shutil.rmtree(DEMAND_CLIPPED_ROOT)
 
-    print_log(f'Creating DEMAND_CLIPPED_ROOT {CLIPPED_ROOT}')
+    print_log(f'Creating DEMAND_CLIPPED_ROOT {DEMAND_CLIPPED_ROOT}')
     print_log(
         f'duration={args.duration}s seed={args.seed} train_n={args.train_n} '
         f'target_sr={args.target_sr} regions={SPLIT_REGIONS}'
     )
-    CLIPPED_ROOT.mkdir(parents=True, exist_ok=True)
+    DEMAND_CLIPPED_ROOT.mkdir(parents=True, exist_ok=True)
 
     sources = _iter_raw_ch01()
     if not sources:
-        print_error(f'No ch01.wav under {RAW_DEMAND_ROOT}')
+        print_error(f'No ch01.wav under {DEMAND_ROOT}')
         raise SystemExit(1)
 
     total = 0
@@ -183,7 +179,7 @@ def main() -> None:
             train_n=int(args.train_n),
             target_sr=int(args.target_sr),
         )
-    print_log(f'Done. wrote {total} clips under {CLIPPED_ROOT}')
+    print_log(f'Done. wrote {total} clips under {DEMAND_CLIPPED_ROOT}')
 
 
 if __name__ == '__main__':
