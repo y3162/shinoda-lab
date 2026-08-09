@@ -22,7 +22,13 @@ import torch
 import torchaudio
 from tqdm import tqdm
 
-from src.config import PROJECT_ROOT, DEMAND_ROOT, DEMAND_CLIPPED_ROOT, DEFAULT_SAMPLE_RATE
+from src.config import (
+    PROJECT_ROOT,
+    DEMAND_ROOT,
+    DEMAND_CLIPPED_ROOT,
+    DEFAULT_SAMPLE_RATE,
+    resolve_project_path,
+)
 from src.utils.demand import get_noise_type
 from src.utils.print import print_error, print_log
 
@@ -65,6 +71,7 @@ def clip_one_file(
     train_n: int,
     target_sr: int = DEFAULT_SAMPLE_RATE,
 ) -> int:
+    audio_file = resolve_project_path(audio_file)
     audio, sr = torchaudio.load(str(audio_file))
     noise_type = get_noise_type(audio_file)
     n_written = 0

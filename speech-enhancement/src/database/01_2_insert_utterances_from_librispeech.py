@@ -16,7 +16,7 @@ from src.utils.librispeech import (
     get_speaker_id,
     get_section_id,
 )
-from src.config import PROJECT_ROOT, SQL_ROOT
+from src.config import PROJECT_ROOT, SQL_ROOT, resolve_project_path
 
 
 def batched(
@@ -52,6 +52,7 @@ def iter_utterance_rows() -> Iterator[UtteranceRow]:
         )
 
         for audio_path, transcript in utterances:
+            audio_path = resolve_project_path(audio_path)
             audio, sample_rate = torchaudio.load(audio_path)
 
             assert audio.dim() == 2, 'Audio must have 2 dimensions'

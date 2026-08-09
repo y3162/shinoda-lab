@@ -1,6 +1,7 @@
 """Insert additive noise_configs: clean, single-file, and dual-file mixes."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import random
@@ -88,7 +89,6 @@ def insert_noise_config(
         print_error('noises table is empty; insert clipped DEMAND first')
         raise SystemExit(1)
 
-    # DBから返される順序に依存せず、Python側で明示的にソートする
     rows = sorted(
         rows,
         key=lambda row: (
@@ -106,7 +106,6 @@ def insert_noise_config(
     for noise_id, noise_type, split in rows:
         by_split_type[str(split)][str(noise_type)].append(int(noise_id))
 
-    # 念のため、各noise_type内のIDも明示的にソートする
     for type_to_ids in by_split_type.values():
         for noise_ids in type_to_ids.values():
             noise_ids.sort()
@@ -168,7 +167,6 @@ def insert_noise_config(
                     )
                     continue
 
-                # hash(split)は使わない
                 rng = random.Random(
                     get_split_seed(seed, split)
                 )
@@ -201,7 +199,6 @@ def insert_noise_config(
                     snr_1 = rng.randint(SNR_MIN, SNR_MAX)
                     snr_2 = rng.randint(SNR_MIN, SNR_MAX)
 
-                    # 順序を正規化する
                     pair = tuple(sorted([
                         (
                             type_1,
@@ -227,7 +224,6 @@ def insert_noise_config(
                         f'only made {len(pairs)}/{n_dual}'
                     )
 
-                # 選択自体は疑似乱数だが、挿入順は常に一定にする
                 pairs.sort()
 
                 for pair in pairs:
@@ -267,3 +263,24 @@ def insert_noise_config(
         raise
 
     print_log('noise_configs insert committed')
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=0)
+    args = parser.parse_args()
+
+    if not SQL_ROOT.exists():
+        print_error(f'SQL database does not exist at {SQL_ROOT}')
+        raise SystemExit(1)
+
+    print_log(f'Inserting noise configs into {SQL_ROOT}')
+    con = db.connect(str(SQL_ROOT))
+    try:
+        insert_noise_config(con, seed=args.seed)
+    finally:
+        con.close()
+
+
+if __name__ == '__main__':
+    main()

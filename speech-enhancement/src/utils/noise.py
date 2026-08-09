@@ -4,7 +4,7 @@ import torch
 import torchaudio
 import json
 import duckdb as db
-from src.config import DEFAULT_SAMPLE_RATE
+from src.config import DEFAULT_SAMPLE_RATE, resolve_project_path
 from src.utils.print import print_warning
 
 
@@ -29,7 +29,7 @@ def get_noise_option(
                 """,
                 [noise_id],
             ).fetchone()
-            arg['audiofile_path'] = noise_path[0]
+            arg['audiofile_path'] = str(resolve_project_path(noise_path[0]))
             parsed_args.append(arg)
         else:
             parsed_args.append(arg)

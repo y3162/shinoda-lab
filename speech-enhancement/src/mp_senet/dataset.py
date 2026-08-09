@@ -1,11 +1,13 @@
 import os
 import random
-from pathlib import Path
 
 import duckdb as db
 import librosa
 import torch
 import torchaudio
+
+from src.config import resolve_project_path
+
 
 def get_voicebank_filelist(training_file, validation_file):
     with open(training_file, 'r', encoding='utf-8') as fi:
@@ -224,7 +226,7 @@ class LibriSpeechNoiseDataset(torch.utils.data.Dataset):
         self.seed = seed
 
     def _load_clean_audio(self, audio_path):
-        waveform, sample_rate = torchaudio.load(audio_path)
+        waveform, sample_rate = torchaudio.load(resolve_project_path(audio_path))
         if waveform.dim() == 2:
             waveform = waveform.mean(dim=0)
         else:
@@ -317,7 +319,7 @@ def build_datasets(config):
         if ls.sql_root is None:
             raise ValueError('data.librispeech.sql_root is required')
 
-        sql_root = Path(ls.sql_root)
+        sql_root = resolve_project_path(ls.sql_root)
         con = db.connect(str(sql_root), read_only=True)
         max_frames = _max_frame_count(con, ls.train_splits)
         con.close()

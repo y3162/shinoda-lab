@@ -15,7 +15,7 @@ from src.utils.demand import (
     get_noise_type,
     parse_clip_split,
 )
-from src.config import PROJECT_ROOT, SQL_ROOT
+from src.config import PROJECT_ROOT, SQL_ROOT, resolve_project_path
 
 
 def batched(
@@ -42,6 +42,7 @@ def iter_noise_rows() -> Iterator[NoiseRow]:
         desc='Parsing clipped DEMAND files',
         unit='file',
     ):
+        audio_file = resolve_project_path(audio_file)
         split = parse_clip_split(audio_file)
         if split is None:
             continue
