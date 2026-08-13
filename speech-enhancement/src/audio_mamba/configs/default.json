@@ -1,0 +1,64 @@
+{
+    "checkpoint_root": "data/checkpoints/audio_mamba",
+    "data": {
+        "dataset": "librispeech",
+        "sampling_rate": 16000,
+        "segment_size": 163840,
+        "mel": {
+            "n_fft": 1024,
+            "hop_size": 160,
+            "win_size": 1024,
+            "n_mels": 128,
+            "f_min": 0.0,
+            "f_max": 8000.0,
+            "eps": 1e-6
+        },
+        "specaug": {
+            "time_mask": 48,
+            "freq_mask": 48
+        },
+        "librispeech": {
+            "sql_root": null,
+            "train_splits": ["train-clean-100", "train-clean-360"],
+            "validation_splits": ["dev-clean"],
+            "noise_config_ids": null
+        }
+    },
+    "model": {
+        "spectrogram_size": [128, 1024],
+        "patch_size": [16, 16],
+        "strides": [16, 16],
+        "in_chans": 1,
+        "embed_dim": 768,
+        "depth": 24,
+        "d_state": 16,
+        "d_conv": 4,
+        "expand": 2,
+        "norm_epsilon": 1e-05,
+        "rms_norm": true,
+        "drop_rate": 0.0,
+        "num_classes": 18,
+        "snr_loss_weight": 0.05
+    },
+    "train": {
+        "env": {
+            "batch_size": 128,
+            "seed": 42,
+            "num_workers": 4,
+            "prefetch_factor": 2,
+            "epochs": 1000,
+            "summary_interval": 100,
+            "max_steps": null,
+            "val_batch_size": 8,
+            "warmup_steps": 1000
+        },
+        "optim": {
+            "learning_rate": 5e-5,
+            "adam_b1": 0.95,
+            "adam_b2": 0.999,
+            "weight_decay": 5e-7,
+            "lr_milestones": [10, 15],
+            "lr_gamma": 0.5
+        }
+    }
+}
