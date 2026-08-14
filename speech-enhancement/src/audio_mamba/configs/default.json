@@ -42,7 +42,7 @@
     },
     "train": {
         "env": {
-            "batch_size": 128,
+            "batch_size": 64,
             "seed": 42,
             "num_workers": 4,
             "prefetch_factor": 2,
