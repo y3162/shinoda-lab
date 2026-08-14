@@ -6,6 +6,8 @@ import torchaudio
 
 from src.config import resolve_project_path
 
+CLEAN_NOISE_TYPE = 'clean'
+
 
 def _load_librispeech_utterances(con, splits):
     placeholders = ', '.join(['?'] * len(splits))
@@ -69,7 +71,11 @@ def _build_noise_type_index(con):
         """,
     ).fetchall()
     noise_types = [row[0] for row in rows]
-    return {name: index for index, name in enumerate(noise_types)}
+    # clean + DEMAND types (sorted). clean is always index 0.
+    return {
+        CLEAN_NOISE_TYPE: 0,
+        **{name: index + 1 for index, name in enumerate(noise_types)},
+    }
 
 
 def _resolve_noise_type(con, noise_id):
@@ -86,11 +92,27 @@ def _resolve_noise_type(con, noise_id):
     return row[0]
 
 
-def _load_single_noise_options(con, noise_config_ids, noise_split=None):
+def _make_clean_option(noise_type_to_idx):
+    return {
+        'generator_type': 'additive',
+        'kind': 'clean',
+        'args': [],
+        'noise_type': CLEAN_NOISE_TYPE,
+        'noise_type_idx': noise_type_to_idx[CLEAN_NOISE_TYPE],
+        'is_clean': True,
+    }
+
+
+def _load_noise_options(con, noise_config_ids, noise_split=None):
+    from src.utils.noise import get_noise_option
+
+    noise_type_to_idx = _build_noise_type_index(con)
+    options = []
+
     if noise_config_ids is None:
         if noise_split is None:
             raise ValueError('noise_split is required when noise_config_ids is None')
-        rows = con.execute(
+        single_rows = con.execute(
             """
             SELECT id
             FROM noise_configs
@@ -101,29 +123,31 @@ def _load_single_noise_options(con, noise_config_ids, noise_split=None):
             """,
             [noise_split],
         ).fetchall()
-        noise_config_ids = [row[0] for row in rows]
+        noise_config_ids = [row[0] for row in single_rows]
+        # Always include a clean class option for both train/dev pools.
+        options.append(_make_clean_option(noise_type_to_idx))
     else:
         noise_config_ids = list(noise_config_ids)
 
-    if not noise_config_ids:
-        raise ValueError('No single-noise config ids available')
+    if not noise_config_ids and not options:
+        raise ValueError('No noise config ids available')
 
-    from src.utils.noise import get_noise_option
-
-    noise_type_to_idx = _build_noise_type_index(con)
-    options = []
     for noise_config_id in noise_config_ids:
         option = get_noise_option(con, noise_config_id)
-        if not option.get('args'):
+        args = option.get('args') or []
+        if len(args) == 0:
+            clean_option = _make_clean_option(noise_type_to_idx)
+            if not any(item.get('is_clean') for item in options):
+                options.append(clean_option)
             continue
-        if option.get('kind') not in (None, 'single') and len(option['args']) != 1:
+        if option.get('kind') not in (None, 'single'):
             continue
-        if len(option['args']) != 1:
+        if len(args) != 1:
             continue
         if noise_split is not None and option.get('split') not in (None, noise_split):
             continue
 
-        noise_id = option['args'][0].get('noise_id')
+        noise_id = args[0].get('noise_id')
         if noise_id is None:
             continue
         noise_type = _resolve_noise_type(con, noise_id)
@@ -133,12 +157,28 @@ def _load_single_noise_options(con, noise_config_ids, noise_split=None):
         option = dict(option)
         option['noise_type'] = noise_type
         option['noise_type_idx'] = noise_type_to_idx[noise_type]
+        option['is_clean'] = False
         options.append(option)
 
     if not options:
-        raise ValueError('Resolved single-noise options are empty')
+        raise ValueError('Resolved noise options are empty')
 
-    return options, noise_type_to_idx
+    options_by_type = {name: [] for name in noise_type_to_idx}
+    for option in options:
+        options_by_type[option['noise_type']].append(option)
+
+    for name, type_options in options_by_type.items():
+        if not type_options:
+            raise ValueError(f'No noise options for class {name}')
+
+    # Index order: clean at 0, then DEMAND types by sorted name.
+    class_names = [
+        name for name, _ in sorted(
+            noise_type_to_idx.items(),
+            key=lambda item: item[1],
+        )
+    ]
+    return options, noise_type_to_idx, options_by_type, class_names
 
 
 def normalize_and_segment(waveform, segment_size, split):
@@ -245,7 +285,12 @@ class LibriSpeechNoiseEstimationDataset(torch.utils.data.Dataset):
         con = db.connect(str(sql_root), read_only=True)
         try:
             self.utterances = _load_librispeech_utterances(con, splits)
-            self.noise_options, self.noise_type_to_idx = _load_single_noise_options(
+            (
+                self.noise_options,
+                self.noise_type_to_idx,
+                self.options_by_type,
+                self.class_names,
+            ) = _load_noise_options(
                 con,
                 noise_config_ids,
                 noise_split=noise_split,
@@ -259,6 +304,11 @@ class LibriSpeechNoiseEstimationDataset(torch.utils.data.Dataset):
                 f'Expected {num_classes} noise classes, got {len(self.noise_type_to_idx)}: '
                 f'{sorted(self.noise_type_to_idx)}'
             )
+        if len(self.class_names) != num_classes:
+            raise ValueError(
+                f'Expected {num_classes} class_names, got {len(self.class_names)}'
+            )
+        self.clean_class_index = self.noise_type_to_idx[CLEAN_NOISE_TYPE]
 
         self.segment_size = int(data_cfg.segment_size)
         self.sampling_rate = int(data_cfg.sampling_rate)
@@ -299,6 +349,10 @@ class LibriSpeechNoiseEstimationDataset(torch.utils.data.Dataset):
 
         return waveform
 
+    def _sample_noise_option(self, rng):
+        class_name = rng.choice(self.class_names)
+        return rng.choice(self.options_by_type[class_name])
+
     def __getitem__(self, index):
         from src.utils.noise import NoiseGenerator
         from src.utils.validation import deterministic_noise_seed
@@ -307,12 +361,12 @@ class LibriSpeechNoiseEstimationDataset(torch.utils.data.Dataset):
         clean_audio = self._load_clean_audio(audio_path)
 
         if self.seed is None:
-            noise_option = random.choice(self.noise_options)
+            noise_option = self._sample_noise_option(random)
             torch_rng = None
         else:
             sample_seed = deterministic_noise_seed(self.seed, index)
             py_rng = random.Random(sample_seed)
-            noise_option = py_rng.choice(self.noise_options)
+            noise_option = self._sample_noise_option(py_rng)
             torch_rng = torch.Generator()
             torch_rng.manual_seed(sample_seed & 0xFFFFFFFFFFFFFFFF)
 
@@ -340,11 +394,17 @@ class LibriSpeechNoiseEstimationDataset(torch.utils.data.Dataset):
             noise_option['noise_type_idx'],
             dtype=torch.long,
         )
-        snr_db = torch.tensor(
-            float(noisy_result.options[0]['snr_db']),
-            dtype=torch.float32,
-        )
-        return mel, noise_type_idx, snr_db
+        is_clean = bool(noise_option.get('is_clean')) or not noisy_result.options
+        if is_clean:
+            snr_db = torch.tensor(0.0, dtype=torch.float32)
+            snr_valid = torch.tensor(False)
+        else:
+            snr_db = torch.tensor(
+                float(noisy_result.options[0]['snr_db']),
+                dtype=torch.float32,
+            )
+            snr_valid = torch.tensor(True)
+        return mel, noise_type_idx, snr_db, snr_valid
 
     def __len__(self):
         return len(self.utterances)

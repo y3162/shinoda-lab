@@ -176,11 +176,22 @@ def build_model_and_optim(config, device):
     return model, optim, scheduler, loss_fn
 
 
-def compute_batch_metrics(output, noise_type, snr_db):
+def compute_batch_metrics(output, noise_type, snr_db, snr_valid=None):
     preds = output.noise_type_logits.argmax(dim=1)
     accuracy = (preds == noise_type).float().mean().item()
-    snr_mae = (output.snr_db.detach().view(-1) - snr_db.view(-1)).abs().mean().item()
-    return accuracy, snr_mae
+    snr_pred = output.snr_db.detach().view(-1)
+    snr_target = snr_db.view(-1)
+    if snr_valid is None:
+        snr_mae = (snr_pred - snr_target).abs().mean().item()
+        snr_n = float(snr_pred.numel())
+    else:
+        mask = snr_valid.view(-1).bool()
+        snr_n = float(mask.sum().item())
+        if snr_n > 0:
+            snr_mae = (snr_pred[mask] - snr_target[mask]).abs().mean().item()
+        else:
+            snr_mae = 0.0
+    return accuracy, snr_mae, snr_n
 
 
 def validate(model, loss_fn, validset, device, config, rank, world_size, epoch):
@@ -208,6 +219,7 @@ def validate(model, loss_fn, validset, device, config, rank, world_size, epoch):
         'accuracy': 0.0,
         'snr_mae': 0.0,
         'n': 0,
+        'snr_n': 0.0,
     }
     pbar = None
     if rank == 0:
@@ -219,22 +231,26 @@ def validate(model, loss_fn, validset, device, config, rank, world_size, epoch):
         )
 
     with torch.no_grad():
-        for mel, noise_type, snr_db in loader:
+        for mel, noise_type, snr_db, snr_valid in loader:
             mel = mel.to(device, non_blocking=True)
             noise_type = noise_type.to(device, non_blocking=True)
             snr_db = snr_db.to(device, non_blocking=True)
+            snr_valid = snr_valid.to(device, non_blocking=True)
 
             output = model(mel)
-            losses = loss_fn(output, noise_type, snr_db)
-            accuracy, snr_mae = compute_batch_metrics(output, noise_type, snr_db)
+            losses = loss_fn(output, noise_type, snr_db, snr_valid)
+            accuracy, snr_mae, snr_n = compute_batch_metrics(
+                output, noise_type, snr_db, snr_valid,
+            )
 
             batch_n = mel.size(0)
             totals['loss'] += losses['loss'].item() * batch_n
             totals['noise_type_loss'] += losses['noise_type_loss'].item() * batch_n
             totals['snr_loss'] += losses['snr_loss'].item() * batch_n
             totals['accuracy'] += accuracy * batch_n
-            totals['snr_mae'] += snr_mae * batch_n
+            totals['snr_mae'] += snr_mae * snr_n
             totals['n'] += batch_n
+            totals['snr_n'] += snr_n
 
             if pbar is not None:
                 pbar.set_postfix(format_postfix(
@@ -248,12 +264,13 @@ def validate(model, loss_fn, validset, device, config, rank, world_size, epoch):
         pbar.close()
 
     n = aggregate_sum(totals['n'], device, world_size)
+    snr_n = aggregate_sum(totals['snr_n'], device, world_size)
     return {
         'loss': aggregate_sum(totals['loss'], device, world_size) / max(n, 1),
         'noise_type_loss': aggregate_sum(totals['noise_type_loss'], device, world_size) / max(n, 1),
         'snr_loss': aggregate_sum(totals['snr_loss'], device, world_size) / max(n, 1),
         'accuracy': aggregate_sum(totals['accuracy'], device, world_size) / max(n, 1),
-        'snr_mae': aggregate_sum(totals['snr_mae'], device, world_size) / max(n, 1),
+        'snr_mae': aggregate_sum(totals['snr_mae'], device, world_size) / max(snr_n, 1),
     }
 
 
@@ -348,20 +365,23 @@ def train(config):
         epoch_acc = 0.0
         epoch_batches = 0
 
-        for mel, noise_type, snr_db in train_loader:
+        for mel, noise_type, snr_db, snr_valid in train_loader:
             set_warmup_lr(optim, base_lr, steps, warmup_steps)
 
             mel = mel.to(device, non_blocking=True)
             noise_type = noise_type.to(device, non_blocking=True)
             snr_db = snr_db.to(device, non_blocking=True)
+            snr_valid = snr_valid.to(device, non_blocking=True)
 
             optim.zero_grad()
             output = model(mel)
-            losses = loss_fn(output, noise_type, snr_db)
+            losses = loss_fn(output, noise_type, snr_db, snr_valid)
             losses['loss'].backward()
             optim.step()
 
-            accuracy, snr_mae = compute_batch_metrics(output, noise_type, snr_db)
+            accuracy, snr_mae, _ = compute_batch_metrics(
+                output, noise_type, snr_db, snr_valid,
+            )
             epoch_loss += losses['loss'].item()
             epoch_acc += accuracy
             epoch_batches += 1

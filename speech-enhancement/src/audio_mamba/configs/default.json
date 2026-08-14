@@ -37,7 +37,7 @@
         "norm_epsilon": 1e-05,
         "rms_norm": true,
         "drop_rate": 0.0,
-        "num_classes": 18,
+        "num_classes": 19,
         "snr_loss_weight": 0.05
     },
     "train": {
