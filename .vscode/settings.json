@@ -1,5 +1,9 @@
 {
     "workbench.colorTheme": "Catppuccin Latte",
     "workbench.iconTheme": "catppuccin-latte",
-    "editor.cursorBlinking": "expand"
+    "editor.cursorBlinking": "expand",
+    "workbench.editorAssociations": {
+        "*.parquet": "parquet-visualizer.parquetVisualizer",
+        "*.csv": "default"
+    }
 }
