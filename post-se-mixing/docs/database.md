@@ -73,3 +73,25 @@ Each row is one ASR result for `(run, utterance, mixture_family, mixture_coeff)`
 ```bash
 python -m src.database.05_1_create_table_observation_asr_results
 ```
+
+---
+
+## Insert Observation ASR Results for One Utterance
+
+SE once, then ASR on the linear coefficient grid (`-0.5, -0.4, ..., 1.5`).
+Existing `(run, utterance, linear, coeff)` rows are skipped.
+Use `base_env`. `checkpoint_dir` may be absolute or `PROJECT_ROOT`-relative; the database stores it relative to `PROJECT_ROOT`.
+
+```bash
+source ./commands/export.sh
+source ./.venv/base_env/bin/activate
+python -m src.database.06_1_insert_utterance_observation_asr_results \
+    --utterance_id 7386 \
+    --se_model_name semamba_pp \
+    --checkpoint_dir data/checkpoints/20260803_215715 \
+    --checkpoint_name g_best \
+    --asr_model_name parakeet-tdt-0.6b-v2 \
+    --noise_config_id 26417 \
+    --noise_seed 0 \
+    --split test-clean
+```

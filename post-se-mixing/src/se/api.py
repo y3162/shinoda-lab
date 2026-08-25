@@ -4,6 +4,16 @@ import torch
 import torch.nn as nn
 
 
+def _patch_mamba_transformers_generation() -> None:
+    """mamba_ssm 2.2.4 imports removed transformers generation names."""
+    import transformers.generation as generation
+    if hasattr(generation, 'GreedySearchDecoderOnlyOutput'):
+        return
+    from transformers.generation.utils import GenerateDecoderOnlyOutput
+    generation.GreedySearchDecoderOnlyOutput = GenerateDecoderOnlyOutput
+    generation.SampleDecoderOnlyOutput = GenerateDecoderOnlyOutput
+
+
 class SEModel(nn.Module):
     def __init__(
         self,
@@ -36,6 +46,7 @@ class SEModel(nn.Module):
                 self._stft = mag_pha_stft
                 self._istft = mag_pha_istft
             case 'semamba':
+                _patch_mamba_transformers_generation()
                 from src.se.se_mamba.model.semamba import SEMamba
                 from src.se.se_mamba.model.stfts import mag_phase_istft, mag_phase_stft
                 from src.se.se_mamba.utils import json_to_namespace, load_checkpoint
@@ -44,6 +55,7 @@ class SEModel(nn.Module):
                 self._stft = mag_phase_stft
                 self._istft = mag_phase_istft
             case 'semamba_pp':
+                _patch_mamba_transformers_generation()
                 from src.se.se_mamba_pp.model.semambapp import SEMambapp
                 from src.se.se_mamba_pp.model.stfts import mag_phase_istft, mag_phase_stft
                 from src.se.se_mamba_pp.utils import json_to_namespace, load_checkpoint
