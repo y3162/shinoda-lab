@@ -1,0 +1,87 @@
+from functools import partial
+
+import torch
+import torch.nn as nn
+from mamba_ssm.models.mixer_seq_simple import _init_weights
+from mamba_ssm.modules.block import Block
+from mamba_ssm.modules.mamba_simple import Mamba
+from mamba_ssm.ops.triton.layer_norm import RMSNorm
+
+
+def create_block(
+    d_model,
+    cfg,
+    layer_idx=0,
+    rms_norm=True,
+    fused_add_norm=False,
+    residual_in_fp32=False,
+):
+    mixer_cls = partial(
+        Mamba,
+        layer_idx=layer_idx,
+        d_state=cfg.d_state,
+        d_conv=cfg.d_conv,
+        expand=cfg.expand,
+    )
+    norm_cls = partial(
+        nn.LayerNorm if not rms_norm else RMSNorm, eps=cfg.norm_epsilon,
+    )
+    block = Block(
+        d_model,
+        mixer_cls,
+        mlp_cls=nn.Identity,
+        norm_cls=norm_cls,
+        fused_add_norm=fused_add_norm,
+        residual_in_fp32=residual_in_fp32,
+    )
+    block.layer_idx = layer_idx
+    return block
+
+
+class MambaBlock(nn.Module):
+    def __init__(self, in_channels, cfg):
+        super().__init__()
+        n_layer = 1
+        self.forward_blocks = nn.ModuleList(
+            create_block(in_channels, cfg) for _ in range(n_layer)
+        )
+        self.backward_blocks = nn.ModuleList(
+            create_block(in_channels, cfg) for _ in range(n_layer)
+        )
+        self.apply(partial(_init_weights, n_layer=n_layer))
+
+    def forward(self, x):
+        x_forward, x_backward = x.clone(), torch.flip(x, [1])
+        resi_forward, resi_backward = None, None
+        for layer in self.forward_blocks:
+            x_forward, resi_forward = layer(x_forward, resi_forward)
+        y_forward = (
+            (x_forward + resi_forward) if resi_forward is not None else x_forward
+        )
+        for layer in self.backward_blocks:
+            x_backward, resi_backward = layer(x_backward, resi_backward)
+        y_backward = (
+            torch.flip((x_backward + resi_backward), [1])
+            if resi_backward is not None
+            else torch.flip(x_backward, [1])
+        )
+        return torch.cat([y_forward, y_backward], -1)
+
+
+class TFMambaBlock(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.hid_feature = cfg.hid_feature
+        self.time_mamba = MambaBlock(in_channels=self.hid_feature, cfg=cfg)
+        self.freq_mamba = MambaBlock(in_channels=self.hid_feature, cfg=cfg)
+        self.tlinear = nn.ConvTranspose1d(self.hid_feature * 2, self.hid_feature, 1, stride=1)
+        self.flinear = nn.ConvTranspose1d(self.hid_feature * 2, self.hid_feature, 1, stride=1)
+
+    def forward(self, x):
+        b, c, t, f = x.size()
+        x = x.permute(0, 3, 2, 1).contiguous().view(b * f, t, c)
+        x = self.tlinear(self.time_mamba(x).permute(0, 2, 1)).permute(0, 2, 1) + x
+        x = x.view(b, f, t, c).permute(0, 2, 1, 3).contiguous().view(b * t, f, c)
+        x = self.flinear(self.freq_mamba(x).permute(0, 2, 1)).permute(0, 2, 1) + x
+        x = x.view(b, t, f, c).permute(0, 3, 1, 2)
+        return x
