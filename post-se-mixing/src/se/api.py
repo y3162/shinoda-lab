@@ -72,11 +72,16 @@ class SEModel(nn.Module):
         self.generator.eval()
 
     @torch.inference_mode()
-    def enhance(self, noisy_audio: torch.Tensor) -> torch.Tensor:
+    def enhance(
+        self,
+        noisy_audio: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Enhance noisy waveform(s).
 
         Args:
             noisy_audio: `[B, T]` or `[T]`.
+            lengths: Optional valid sample counts for a padded `[B, T]` batch.
 
         Returns:
             Enhanced waveform with the same shape as the input, on the original
@@ -92,9 +97,21 @@ class SEModel(nn.Module):
             )
 
         noisy_audio = noisy_audio.to(self.device, dtype=torch.float32)
-        length = noisy_audio.size(1)
-        energy = noisy_audio.pow(2).sum(dim=1).clamp_min(1e-12)
-        alpha = torch.sqrt(length / energy).unsqueeze(1)
+        batch_size, max_length = noisy_audio.shape
+        if lengths is None:
+            lengths = torch.full(
+                (batch_size,),
+                max_length,
+                dtype=torch.long,
+                device=self.device,
+            )
+        else:
+            lengths = lengths.to(self.device, dtype=torch.long)
+
+        time_idx = torch.arange(max_length, device=self.device).unsqueeze(0)
+        valid = time_idx < lengths.unsqueeze(1)
+        energy = (noisy_audio.pow(2) * valid).sum(dim=1).clamp_min(1e-12)
+        alpha = torch.sqrt(lengths.to(dtype=torch.float32) / energy).unsqueeze(1)
         normalized = noisy_audio * alpha
 
         stft = self.config.data.stft
@@ -114,10 +131,10 @@ class SEModel(nn.Module):
             stft.win_size,
             stft.compress_factor,
         )
-        if audio_g.size(1) > length:
-            audio_g = audio_g[:, :length]
-        elif audio_g.size(1) < length:
-            audio_g = torch.nn.functional.pad(audio_g, (0, length - audio_g.size(1)))
+        if audio_g.size(1) > max_length:
+            audio_g = audio_g[:, :max_length]
+        elif audio_g.size(1) < max_length:
+            audio_g = torch.nn.functional.pad(audio_g, (0, max_length - audio_g.size(1)))
 
         enhanced = audio_g / alpha
         if squeeze:

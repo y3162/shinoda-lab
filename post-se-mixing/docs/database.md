@@ -60,6 +60,19 @@ One row is one evaluation run: SE model / checkpoint, ASR model, noise config, n
 python -m src.database.04_1_create_table_observation_eval_runs
 ```
 
+### Insert Run IDs per Noise Config
+
+```bash
+python -m src.database.04_2_insert_run_id_per_noise_config \
+    --noise_config_ids 26225,26241,26257 \
+    --splits test-clean \
+    --se_model_name semamba_pp \
+    --checkpoint_dir data/checkpoints/YYYYMMDD_HHMMSS \
+    --checkpoint_name g_best \
+    --asr_model_name parakeet-tdt-0.6b-v2 \
+    --noise_seed 0
+```
+
 ---
 
 ## Create Observation ASR Results Table
@@ -76,22 +89,32 @@ python -m src.database.05_1_create_table_observation_asr_results
 
 ---
 
-## Insert Observation ASR Results for One Utterance
+## Fill Observation ASR Results for Run ID(s)
 
-SE once, then ASR on the linear coefficient grid (`-0.5, -0.4, ..., 1.5`).
+Processes all utterances in each run's `split`. SE and ASR are mini-batched.
 Existing `(run, utterance, linear, coeff)` rows are skipped.
-Use `base_env`. `checkpoint_dir` may be absolute or `PROJECT_ROOT`-relative; the database stores it relative to `PROJECT_ROOT`.
+Linear coeffs: `-0.5, -0.4, ..., 1.5`.
+
+```bash
+# all run ids in observation_eval_runs (default)
+CUDA_VISIBLE_DEVICES=0 bash ./commands/fill_observation_asr_results.sh
+
+# or explicitly
+RUN_ID=all BATCH_SIZE=4 CUDA_VISIBLE_DEVICES=0 \
+    bash ./commands/fill_observation_asr_results.sh
+
+# selected run ids
+RUN_ID=1,2,3 BATCH_SIZE=4 CUDA_VISIBLE_DEVICES=0 \
+    bash ./commands/fill_observation_asr_results.sh
+```
+
+Or:
 
 ```bash
 source ./commands/export.sh
 source ./.venv/base_env/bin/activate
-python -m src.database.06_1_insert_utterance_observation_asr_results \
-    --utterance_id 7386 \
-    --se_model_name semamba_pp \
-    --checkpoint_dir data/checkpoints/20260803_215715 \
-    --checkpoint_name g_best \
-    --asr_model_name parakeet-tdt-0.6b-v2 \
-    --noise_config_id 26417 \
-    --noise_seed 0 \
-    --split test-clean
+CUDA_VISIBLE_DEVICES=0 python -m src.database.05_2_insert_se_asr_results \
+    --run_id 1 \
+    --batch_size 4 \
+    --device cuda:0
 ```

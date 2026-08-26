@@ -8,6 +8,22 @@ from src.config import DEFAULT_SAMPLE_RATE, resolve_project_path
 from src.utils.print import print_warning
 
 
+_NOISE_MONO_CACHE: dict[str, torch.Tensor] = {}
+
+
+def _load_noise_mono_cached(audiofile_path: str) -> torch.Tensor:
+    cached = _NOISE_MONO_CACHE.get(audiofile_path)
+    if cached is not None:
+        return cached
+    noise, sr = torchaudio.load(audiofile_path)
+    if sr != DEFAULT_SAMPLE_RATE:
+        noise = torchaudio.transforms.Resample(sr, DEFAULT_SAMPLE_RATE)(noise)
+    if noise.dim() == 2:
+        noise = noise.mean(dim=0)
+    _NOISE_MONO_CACHE[audiofile_path] = noise
+    return noise
+
+
 def get_noise_option(
     con: db.DuckDBPyConnection,
     noise_config_id: int,
@@ -164,16 +180,13 @@ def audiofile_noise_generation(
     end_frame = common_option.end_frame
 
     audiofile_path = option['audiofile_path']
-
-    noise, sr = torchaudio.load(audiofile_path)
-    if sr != DEFAULT_SAMPLE_RATE:
-        noise = torchaudio.transforms.Resample(sr, DEFAULT_SAMPLE_RATE)(noise)
-    if noise.dim() == 2:
-        noise = noise.mean(dim=0)
+    noise = _load_noise_mono_cached(audiofile_path)
     noise_duration = end_frame - start_frame
     if noise.shape[-1] < noise_duration:
         repeats = (noise_duration // noise.shape[-1]) + 1
         noise = noise.repeat(repeats)
+    else:
+        noise = noise.clone()
     if noise.shape[-1] == noise_duration:
         audiofile_start_frame = 0
     else:

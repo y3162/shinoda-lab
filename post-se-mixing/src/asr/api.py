@@ -32,11 +32,13 @@ class ASRModel(nn.Module):
     def transcribe(
         self,
         audio: torch.Tensor,
+        lengths: torch.Tensor | None = None,
     ) -> str | list[str]:
         """Transcribe waveform(s).
 
         Args:
             audio: `[B, T]` or `[T]`, 16 kHz float waveform.
+            lengths: Optional valid sample counts for a padded `[B, T]` batch.
 
         Returns:
             Transcript string for a single waveform, or a list of transcripts for
@@ -52,12 +54,15 @@ class ASRModel(nn.Module):
             )
 
         audio = audio.to(self.device, dtype=torch.float32)
-        lengths = torch.full(
-            (audio.size(0),),
-            audio.size(1),
-            dtype=torch.long,
-            device=self.device,
-        )
+        if lengths is None:
+            lengths = torch.full(
+                (audio.size(0),),
+                audio.size(1),
+                dtype=torch.long,
+                device=self.device,
+            )
+        else:
+            lengths = lengths.to(self.device, dtype=torch.long)
 
         outputs = self._model(audio, lengths)
         texts = [hypotheses[0].text for hypotheses in outputs.results]
