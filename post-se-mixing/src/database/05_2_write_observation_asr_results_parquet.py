@@ -2,10 +2,41 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 from pathlib import Path
+
+
+def _limit_cpu_threads() -> None:
+    for key, value in (
+        ('OMP_NUM_THREADS', '1'),
+        ('MKL_NUM_THREADS', '1'),
+        ('OPENBLAS_NUM_THREADS', '1'),
+        ('NUMEXPR_NUM_THREADS', '1'),
+        ('TORCH_NUM_THREADS', '1'),
+        ('TORCH_NUM_INTEROP_THREADS', '1'),
+        ('TORCHINDUCTOR_COMPILE_THREADS', '1'),
+        ('TORCHDYNAMO_DISABLE', '1'),
+        ('TOKENIZERS_PARALLELISM', 'false'),
+    ):
+        os.environ.setdefault(key, value)
+
+
+_limit_cpu_threads()
 
 import duckdb as db
 import torch
+
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError as exc:
+    # Already initialized elsewhere; keep going but surface the failure.
+    import sys
+    print(
+        f'[WARNING] torch.set_num_interop_threads(1) failed: {exc}',
+        file=sys.stderr,
+    )
+
 import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
@@ -333,6 +364,11 @@ def main() -> None:
     device = torch.device(args.device)
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
+
+    print_log(
+        f'torch threads={torch.get_num_threads()} '
+        f'interop={torch.get_num_interop_threads()}',
+    )
 
     con = db.connect(str(SQL_ROOT), read_only=True)
     se_model: SEModel | None = None

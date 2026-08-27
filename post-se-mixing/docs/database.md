@@ -149,7 +149,7 @@ Or:
 ```bash
 source ./commands/export.sh
 source ./.venv/base_env/bin/activate
-CUDA_VISIBLE_DEVICES=0 python -m src.database.05_2_insert_se_asr_results \
+CUDA_VISIBLE_DEVICES=0 python -m src.database.05_2_write_observation_asr_results_parquet \
     --run_id 1 \
     --batch_size 4 \
     --device cuda:0
