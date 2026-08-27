@@ -19,26 +19,19 @@ from src.config import (
 from src.se.api import SEModel
 from src.utils.mixture import mix_linear
 from src.utils.noise import NoiseGenerator, get_noise_option
+from src.utils.observation_asr_results_parquet import (
+    load_existing_coeffs,
+    next_batch_index,
+    next_part_path,
+    run_dir,
+    write_batch,
+)
 from src.utils.print import print_error, print_log, print_warning
 from src.utils.wer import norm, utterance_errors
 
 
 MIXTURE_FAMILY = 'linear'
 LINEAR_COEFFS = [round(x * 0.1, 1) for x in range(-5, 16)]
-
-INSERT_SQL = """
-    INSERT INTO observation_asr_results (
-        run_id,
-        utterance_id,
-        mixture_family,
-        mixture_coeff,
-        hypothesis,
-        wer,
-        n_errors,
-        n_ref_words
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-"""
 
 
 def parse_int_list(raw: str) -> list[int]:
@@ -123,26 +116,18 @@ def list_pending_utterances(
 ) -> list[tuple[int, str, str, list[float]]]:
     rows = con.execute(
         """
-        SELECT
-            u.id,
-            u.audio_path,
-            u.transcript,
-            list(r.mixture_coeff) FILTER (WHERE r.mixture_coeff IS NOT NULL)
-                AS existing_coeffs
-        FROM utterances AS u
-        LEFT JOIN observation_asr_results AS r
-            ON r.utterance_id = u.id
-           AND r.run_id = ?
-           AND r.mixture_family = ?
-        WHERE u.split = ?
-        GROUP BY u.id, u.audio_path, u.transcript
-        ORDER BY u.id
+        SELECT id, audio_path, transcript
+        FROM utterances
+        WHERE split = ?
+        ORDER BY id
         """,
-        [run_id, MIXTURE_FAMILY, split],
+        [split],
     ).fetchall()
 
+    existing_by_utterance = load_existing_coeffs(run_id, MIXTURE_FAMILY)
+
     pending: list[tuple[int, str, str, list[float]]] = []
-    for utterance_id, audio_path, transcript, existing_coeffs in rows:
+    for utterance_id, audio_path, transcript in rows:
         utterance_id = int(utterance_id)
         transcript = str(transcript)
         if norm(transcript) == '':
@@ -150,11 +135,7 @@ def list_pending_utterances(
                 f'skip empty reference after normalization: utterance_id={utterance_id}',
             )
             continue
-        existing: set[float] = set()
-        if existing_coeffs is not None:
-            for coeff in existing_coeffs:
-                if coeff is not None:
-                    existing.add(round(float(coeff), 1))
+        existing = existing_by_utterance.get(utterance_id, set())
         missing = [coeff for coeff in LINEAR_COEFFS if coeff not in existing]
         if not missing:
             continue
@@ -200,12 +181,12 @@ def transcribe_padded(
 
 def process_batch(
     *,
-    con: db.DuckDBPyConnection,
     run: dict,
     batch_items: list[tuple[int, str, str, list[float]]],
     noise_option: dict,
     se_model: SEModel,
     asr_model: ASRModel,
+    part_path: Path,
 ) -> int:
     device = se_model.device
     noisys: list[torch.Tensor] = []
@@ -262,7 +243,7 @@ def process_batch(
             n_errors, n_ref_words = utterance_errors(transcript, hypothesis)
             if n_ref_words == 0:
                 print_warning(
-                    f'skip insert: n_ref_words=0 utterance_id={utterance_id}',
+                    f'skip write: n_ref_words=0 utterance_id={utterance_id}',
                 )
                 continue
             rows.append((
@@ -276,8 +257,7 @@ def process_batch(
                 n_ref_words,
             ))
 
-    if rows:
-        con.executemany(INSERT_SQL, rows)
+    write_batch(part_path, rows)
     return len(rows)
 
 
@@ -301,26 +281,31 @@ def fill_run(
         f'pending_utterances={len(pending)} batch_size={batch_size}',
     )
 
-    inserted_total = 0
+    run_dir_path = run_dir(run_id)
+    wrote_total = 0
+    batch_index = next_batch_index(run_id)
     for start in tqdm(range(0, len(pending), batch_size), desc=f'run {run_id}'):
         batch_items = pending[start:start + batch_size]
-        inserted_total += process_batch(
-            con=con,
+        part_path = next_part_path(run_dir_path, batch_index)
+        wrote_total += process_batch(
             run=run,
             batch_items=batch_items,
             noise_option=noise_option,
             se_model=se_model,
             asr_model=asr_model,
+            part_path=part_path,
         )
+        batch_index += 1
 
-    print_log(f'run_id={run_id}: inserted {inserted_total} rows')
+    print_log(f'run_id={run_id}: wrote {wrote_total} rows to {run_dir_path}')
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            'Fill observation_asr_results for registered run_id(s). '
-            'SE/ASR are batched over utterances; existing linear coeffs are skipped.'
+            'Write observation ASR results to Parquet for registered run_id(s). '
+            'SE/ASR are batched over utterances; existing linear coeffs in '
+            'Parquet are skipped.'
         ),
     )
     parser.add_argument(
@@ -349,7 +334,7 @@ def main() -> None:
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
 
-    con = db.connect(SQL_ROOT)
+    con = db.connect(str(SQL_ROOT), read_only=True)
     se_model: SEModel | None = None
     asr_model: ASRModel | None = None
     loaded_key: tuple[str, str, str, str] | None = None

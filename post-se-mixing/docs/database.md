@@ -81,7 +81,7 @@ Filled rows only (no empty placeholders).
 Each row is one ASR result for `(run, utterance, mixture_family, mixture_coeff)`.
 
 - `mixture_family`: `oa` (`obs = enhanced + coeff * noisy`) or `linear` (`obs = coeff * noisy + (1 - coeff) * enhanced`)
-- Training / analysis should use existing rows in this table (computed results only).
+- Parquet fill writes results to disk first; import into this table is not implemented yet.
 
 ```bash
 python -m src.database.05_1_create_table_observation_asr_results
@@ -89,15 +89,43 @@ python -m src.database.05_1_create_table_observation_asr_results
 
 ---
 
-## Fill Observation ASR Results for Run ID(s)
+## Write Observation ASR Results to Parquet for Run ID(s)
 
 Processes all utterances in each run's `split`. SE and ASR are mini-batched.
-Existing `(run, utterance, linear, coeff)` rows are skipped.
+Existing `(run, utterance, linear, coeff)` rows in Parquet are skipped.
 Linear coeffs: `-0.5, -0.4, ..., 1.5`.
 
+Output layout:
+
+```text
+data/parquet/observation_asr_results/run_id={id}/part-{batch:06d}.parquet
+```
+
+Columns (same as `observation_asr_results` without `id`):
+
+`run_id, utterance_id, mixture_family, mixture_coeff, hypothesis, wer, n_errors, n_ref_words`
+
+Multiple fill processes may run concurrently when their `run_id` sets do not overlap.
+Do not run two processes on the same `run_id`.
+
 ```bash
-# all run ids in observation_eval_runs (default)
+# all run ids in observation_eval_runs (default; test → dev → train)
 CUDA_VISIBLE_DEVICES=0 bash ./commands/fill_observation_asr_results.sh
+
+# test-clean runs only (run_id 1–18)
+CUDA_VISIBLE_DEVICES=0 bash ./commands/fill_observation_asr_results_test_clean.sh
+
+# dev-clean runs only (run_id 19–36)
+CUDA_VISIBLE_DEVICES=0 bash ./commands/fill_observation_asr_results_dev_clean.sh
+
+# train-clean-100 (4 shards; run_id 37–54 → 5+5+5+3)
+SHARD=0 CUDA_VISIBLE_DEVICES=0 bash ./commands/fill_observation_asr_results_train_clean_100.sh
+SHARD=1 CUDA_VISIBLE_DEVICES=1 bash ./commands/fill_observation_asr_results_train_clean_100.sh
+SHARD=2 CUDA_VISIBLE_DEVICES=2 bash ./commands/fill_observation_asr_results_train_clean_100.sh
+SHARD=3 CUDA_VISIBLE_DEVICES=3 bash ./commands/fill_observation_asr_results_train_clean_100.sh
+
+# train-clean-360 runs only (run_id 55–72)
+CUDA_VISIBLE_DEVICES=0 bash ./commands/fill_observation_asr_results_train_clean_360.sh
 
 # or explicitly
 RUN_ID=all BATCH_SIZE=4 CUDA_VISIBLE_DEVICES=0 \
@@ -106,6 +134,14 @@ RUN_ID=all BATCH_SIZE=4 CUDA_VISIBLE_DEVICES=0 \
 # selected run ids
 RUN_ID=1,2,3 BATCH_SIZE=4 CUDA_VISIBLE_DEVICES=0 \
     bash ./commands/fill_observation_asr_results.sh
+```
+
+Query Parquet with DuckDB:
+
+```sql
+SELECT run_id, COUNT(*)
+FROM read_parquet('data/parquet/observation_asr_results/run_id=1/part-*.parquet')
+GROUP BY run_id;
 ```
 
 Or:
