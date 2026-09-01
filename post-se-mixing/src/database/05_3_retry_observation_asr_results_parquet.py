@@ -14,22 +14,28 @@ from src.database.observation_asr_results_fill_common import (
     limit_cpu_threads,
     list_pending_utterances,
     parse_int_list,
-    process_batch_normal,
+    process_batch_retry,
     validate_sql_root,
 )
 from src.utils.noise import get_noise_option
-from src.utils.observation_asr_results_parquet import next_batch_index, next_part_path, run_dir
+from src.utils.observation_asr_results_parquet import (
+    list_run_ids_with_pending,
+    next_batch_index,
+    next_part_path,
+    run_dir,
+)
 from src.utils.print import print_error, print_log, print_warning
+
+RETRY_BATCH_SIZE = 1
 
 limit_cpu_threads()
 init_torch_threads()
 
 
-def fill_run(
+def fill_run_retry(
     *,
     con: db.DuckDBPyConnection,
     run: dict,
-    batch_size: int,
     model_cache: ModelCache,
 ) -> None:
     run_id = run['id']
@@ -41,20 +47,19 @@ def fill_run(
 
     print_log(
         f'run_id={run_id} split={run["split"]} '
-        f'pending_utterances={len(pending)} batch_size={batch_size}',
+        f'pending_utterances={len(pending)} batch_size={RETRY_BATCH_SIZE}',
     )
 
     se_model, asr_model = model_cache.ensure_loaded(run)
     run_dir_path = run_dir(run_id)
     wrote_total = 0
     batch_index = next_batch_index(run_id)
-    for start in tqdm(range(0, len(pending), batch_size), desc=f'run {run_id}'):
-        batch_items = pending[start:start + batch_size]
+    for batch_items in tqdm(pending, desc=f'retry run {run_id}'):
         part_path = next_part_path(run_dir_path, batch_index)
         try:
-            wrote_total += process_batch_normal(
+            wrote_total += process_batch_retry(
                 run=run,
-                batch_items=batch_items,
+                batch_items=[batch_items],
                 noise_option=noise_option,
                 se_model=se_model,
                 asr_model=asr_model,
@@ -63,8 +68,8 @@ def fill_run(
             batch_index += 1
         except Exception as exc:
             print_warning(
-                f'batch failed run_id={run_id} batch_index={batch_index} '
-                f'utterance_ids={[item[0] for item in batch_items]}: {exc}',
+                f'retry batch failed run_id={run_id} batch_index={batch_index} '
+                f'utterance_id={batch_items[0]}: {exc}',
             )
             if model_cache.device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -73,31 +78,40 @@ def fill_run(
     print_log(f'run_id={run_id}: wrote {wrote_total} rows to {run_dir_path}')
 
 
+def resolve_run_ids(con: db.DuckDBPyConnection, run_ids: list[int] | None) -> list[int]:
+    if run_ids is not None:
+        return run_ids
+    pending = list_run_ids_with_pending(con)
+    if not pending:
+        print_log('no pending runs')
+        return []
+    print_log(f'pending run_ids: {",".join(str(run_id) for run_id in pending)}')
+    return pending
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            'Write observation ASR results to Parquet for registered run_id(s). '
-            'SE/ASR are batched over utterances; existing linear coeffs in '
-            'Parquet are skipped.'
+            'Retry observation ASR Parquet fill for pending (run, utterance, coeff) '
+            'rows only. Always uses batch_size=1; OOM falls back to mix-by-mix ASR '
+            'then skips individual coeffs.'
         ),
     )
     parser.add_argument(
         '--run_id',
         type=parse_int_list,
-        required=True,
-        help='Comma-separated observation_eval_runs.id values',
+        default=None,
+        help=(
+            'Comma-separated observation_eval_runs.id values. '
+            'If omitted, all runs with pending Parquet gaps are processed.'
+        ),
     )
-    parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument(
         '--device',
         type=str,
         default='cuda:0' if torch.cuda.is_available() else 'cpu',
     )
     args = parser.parse_args()
-
-    if args.batch_size < 1:
-        print_error(f'batch_size must be >= 1, got {args.batch_size}')
-        raise SystemExit(1)
 
     validate_sql_root()
 
@@ -113,12 +127,14 @@ def main() -> None:
     con = db.connect(str(SQL_ROOT), read_only=True)
     model_cache = ModelCache(device)
     try:
-        for run_id in args.run_id:
+        run_ids = resolve_run_ids(con, args.run_id)
+        if not run_ids:
+            return
+        for run_id in run_ids:
             run = get_run(con, run_id)
-            fill_run(
+            fill_run_retry(
                 con=con,
                 run=run,
-                batch_size=args.batch_size,
                 model_cache=model_cache,
             )
     finally:

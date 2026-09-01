@@ -5,6 +5,7 @@ from pathlib import Path
 import duckdb as db
 
 from src.config import PARQUET_ROOT
+from src.utils.wer import norm
 
 
 RESULT_COLUMNS = (
@@ -28,6 +29,8 @@ ObservationAsrResultRow = tuple[
     int,
     int,
 ]
+
+DEFAULT_LINEAR_COEFFS = [round(x * 0.1, 1) for x in range(-5, 16)]
 
 
 def results_root() -> Path:
@@ -63,6 +66,70 @@ def has_parts(run_id: int) -> bool:
     return any(run_dir(run_id).glob('part-*.parquet'))
 
 
+def part_glob(run_id: int) -> str:
+    return _part_glob(run_id)
+
+
+def count_parquet_rows(run_id: int) -> int:
+    if not has_parts(run_id):
+        return 0
+    con = db.connect()
+    try:
+        row = con.execute(
+            """
+            SELECT COUNT(*)
+            FROM read_parquet(?)
+            """,
+            [part_glob(run_id)],
+        ).fetchone()
+    finally:
+        con.close()
+    return int(row[0])
+
+
+def count_parquet_distinct_keys(run_id: int) -> int:
+    if not has_parts(run_id):
+        return 0
+    con = db.connect()
+    try:
+        row = con.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT DISTINCT
+                    run_id,
+                    utterance_id,
+                    mixture_family,
+                    mixture_coeff
+                FROM read_parquet(?)
+            )
+            """,
+            [part_glob(run_id)],
+        ).fetchone()
+    finally:
+        con.close()
+    return int(row[0])
+
+
+def list_run_ids_with_parquet(con: db.DuckDBPyConnection) -> list[int]:
+    rows = con.execute(
+        """
+        SELECT id
+        FROM observation_eval_runs
+        ORDER BY
+            CASE split
+                WHEN 'test-clean' THEN 0
+                WHEN 'dev-clean' THEN 1
+                WHEN 'train-clean-100' THEN 2
+                WHEN 'train-clean-360' THEN 3
+                ELSE 9
+            END,
+            id
+        """,
+    ).fetchall()
+    return [int(row[0]) for row in rows if has_parts(int(row[0]))]
+
+
 def load_existing_coeffs(
     run_id: int,
     mixture_family: str = 'linear',
@@ -88,6 +155,43 @@ def load_existing_coeffs(
         utterance_id = int(utterance_id)
         existing.setdefault(utterance_id, set()).add(round(float(mixture_coeff), 1))
     return existing
+
+
+def list_run_ids_with_pending(
+    con: db.DuckDBPyConnection,
+    *,
+    mixture_family: str = 'linear',
+    linear_coeffs: list[float] | None = None,
+) -> list[int]:
+    coeffs = linear_coeffs if linear_coeffs is not None else DEFAULT_LINEAR_COEFFS
+    runs = con.execute(
+        """
+        SELECT id, split
+        FROM observation_eval_runs
+        ORDER BY id
+        """,
+    ).fetchall()
+
+    pending_run_ids: list[int] = []
+    for run_id, split in runs:
+        run_id = int(run_id)
+        utterances = con.execute(
+            """
+            SELECT id, transcript
+            FROM utterances
+            WHERE split = ?
+            """,
+            [str(split)],
+        ).fetchall()
+        existing_by_utterance = load_existing_coeffs(run_id, mixture_family)
+        for utterance_id, transcript in utterances:
+            if norm(str(transcript)) == '':
+                continue
+            existing = existing_by_utterance.get(int(utterance_id), set())
+            if any(coeff not in existing for coeff in coeffs):
+                pending_run_ids.append(run_id)
+                break
+    return pending_run_ids
 
 
 def write_batch(path: Path, rows: list[ObservationAsrResultRow]) -> None:
