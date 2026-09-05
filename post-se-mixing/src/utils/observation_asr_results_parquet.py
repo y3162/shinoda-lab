@@ -5,7 +5,6 @@ from pathlib import Path
 import duckdb as db
 
 from src.config import PARQUET_ROOT
-from src.utils.wer import norm
 
 
 RESULT_COLUMNS = (
@@ -155,43 +154,6 @@ def load_existing_coeffs(
         utterance_id = int(utterance_id)
         existing.setdefault(utterance_id, set()).add(round(float(mixture_coeff), 1))
     return existing
-
-
-def list_run_ids_with_pending(
-    con: db.DuckDBPyConnection,
-    *,
-    mixture_family: str = 'linear',
-    linear_coeffs: list[float] | None = None,
-) -> list[int]:
-    coeffs = linear_coeffs if linear_coeffs is not None else DEFAULT_LINEAR_COEFFS
-    runs = con.execute(
-        """
-        SELECT id, split
-        FROM observation_eval_runs
-        ORDER BY id
-        """,
-    ).fetchall()
-
-    pending_run_ids: list[int] = []
-    for run_id, split in runs:
-        run_id = int(run_id)
-        utterances = con.execute(
-            """
-            SELECT id, transcript
-            FROM utterances
-            WHERE split = ?
-            """,
-            [str(split)],
-        ).fetchall()
-        existing_by_utterance = load_existing_coeffs(run_id, mixture_family)
-        for utterance_id, transcript in utterances:
-            if norm(str(transcript)) == '':
-                continue
-            existing = existing_by_utterance.get(int(utterance_id), set())
-            if any(coeff not in existing for coeff in coeffs):
-                pending_run_ids.append(run_id)
-                break
-    return pending_run_ids
 
 
 def write_batch(path: Path, rows: list[ObservationAsrResultRow]) -> None:

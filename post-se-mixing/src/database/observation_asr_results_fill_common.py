@@ -376,7 +376,6 @@ def compute_batch_rows_mix_fallback(
     noise_option: dict,
     se_model: SEModel,
     asr_model: ASRModel,
-    retry_mode: bool,
 ) -> list[tuple]:
     noisys, enhanced_unpadded = prepare_noisys_and_enhanced(
         run=run,
@@ -401,7 +400,7 @@ def compute_batch_rows_mix_fallback(
             utterance_id=utterance_id,
             coeff=coeff,
         )
-        if hypothesis is None and not retry_mode:
+        if hypothesis is None:
             deferred.append((batch_idx, utterance_id, coeff))
         hypotheses.append(hypothesis)
 
@@ -412,7 +411,7 @@ def compute_batch_rows_mix_fallback(
         mix_index=mix_index,
     )
 
-    if deferred and not retry_mode:
+    if deferred:
         rows.extend(
             process_batch_per_coeff_items(
                 run=run,
@@ -465,38 +464,6 @@ def compute_batch_rows_normal(
             noise_option=noise_option,
             se_model=se_model,
             asr_model=asr_model,
-            retry_mode=False,
-        )
-
-
-def compute_batch_rows_retry(
-    *,
-    run: dict,
-    batch_items: list[BatchItem],
-    noise_option: dict,
-    se_model: SEModel,
-    asr_model: ASRModel,
-) -> list[tuple]:
-    if len(batch_items) != 1:
-        raise ValueError('retry batch must contain exactly one utterance')
-    try:
-        return compute_batch_rows_once(
-            run=run,
-            batch_items=batch_items,
-            noise_option=noise_option,
-            se_model=se_model,
-            asr_model=asr_model,
-        )
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
-        print_log('retry: utterance batch OOM; falling back to mix-by-mix ASR')
-        return compute_batch_rows_mix_fallback(
-            run=run,
-            batch_items=batch_items,
-            noise_option=noise_option,
-            se_model=se_model,
-            asr_model=asr_model,
-            retry_mode=True,
         )
 
 
@@ -510,26 +477,6 @@ def process_batch_normal(
     part_path: Path,
 ) -> int:
     rows = compute_batch_rows_normal(
-        run=run,
-        batch_items=batch_items,
-        noise_option=noise_option,
-        se_model=se_model,
-        asr_model=asr_model,
-    )
-    write_batch(part_path, rows)
-    return len(rows)
-
-
-def process_batch_retry(
-    *,
-    run: dict,
-    batch_items: list[BatchItem],
-    noise_option: dict,
-    se_model: SEModel,
-    asr_model: ASRModel,
-    part_path: Path,
-) -> int:
-    rows = compute_batch_rows_retry(
         run=run,
         batch_items=batch_items,
         noise_option=noise_option,
